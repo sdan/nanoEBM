@@ -1,0 +1,49 @@
+{
+  "model": {
+    "vocab_size": 50304,
+    "block_size": 256,
+    "n_layer": 4,
+    "n_head": 4,
+    "n_embd": 256,
+    "dropout": 0.1,
+    "bias": true,
+    "energy_hidden": 4,
+    "use_shared_embeddings": true,
+    "mcmc_num_steps": 0,
+    "mcmc_step_size": 1.0,
+    "mcmc_step_size_learnable": false,
+    "langevin_noise": 0.0
+  },
+  "data": {
+    "dataset": "shakespeare",
+    "data_path": "shakespeare.txt",
+    "block_size": 256,
+    "batch_size": 32,
+    "num_workers": 0
+  },
+  "train": {
+    "learning_rate": 0.0003,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0,
+    "decay_lr": true,
+    "warmup_iters": 2000,
+    "lr_decay_iters": 100000,
+    "min_lr": 3e-05,
+    "max_steps": 5000,
+    "grad_accum_steps": 1,
+    "eval_interval": 500,
+    "eval_iters": 50,
+    "log_interval": 10,
+    "seed": 1337,
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "compile": false
+  },
+  "out_dir": "out_ebt",
+  "wandb_project": null,
+  "wandb_name": null,
+  "save_interval": 1000,
+  "load_checkpoint": null
+}
