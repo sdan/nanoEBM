@@ -1,0 +1,18 @@
+# Outputs and checkpoints
+out/
+bench_log/
+
+# Data
+data/
+
+# Python
+__pycache__/
+*.pyc
+.Python
+env/
+.venv/
+venv/
+
+# OS
+.DS_Store
+
