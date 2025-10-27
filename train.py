@@ -1,11 +1,11 @@
 """
-train.py - Simple training script for nanoEBM
+train a nanoEBM model
 
 Usage:
     python train.py
-    python train.py --train.learning_rate=1e-3 --train.max_steps=5000
-    python train.py --model.n_layer=12 --data.batch_size=128
-    python train.py --wandb_project=nanoebm
+    python train.py train.learning_rate=1e-3 train.max_steps=5000
+    python train.py model.n_layer=12 data.batch_size=128
+    python train.py wandb_project=nanoebm
 """
 
 import os
@@ -19,11 +19,6 @@ from nanoebm.utils import Logger, save_checkpoint, get_latest_checkpoint, load_c
 
 
 def main(cfg: Config):
-    # Setup
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    device = cfg.train.device if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(cfg.train.seed)
-
     # Logging
     logger = Logger(
         log_dir=cfg.out_dir,
@@ -31,32 +26,39 @@ def main(cfg: Config):
         config=cfg,
         wandb_name=cfg.wandb_name,
     )
+    
+    # Setup based in the config
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    torch.manual_seed(cfg.train.seed)
+    logger.info(f"Setup: device={device}, seed={cfg.train.seed}")
 
-    # Save config using chz.asdict()
+    # Save config to json for future reproducibility
     config_path = os.path.join(cfg.out_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(chz.asdict(cfg), f, indent=2)
-    print(f"✓ Saved config to {config_path}")
+    logger.info(f"Saved config to {config_path}")
 
-    # Data
+    # Load the dataset
     train_loader, train_ds = get_loader(
         cfg.data.data_path,
         cfg.data.block_size,
         cfg.data.batch_size,
         "train"
     )
+    
+    # Because we're not using BPE for character-level model we need to set the vocab size to the actual size of the dataset
     vocab_size = len(train_ds.stoi)
-    print(f"✓ Loaded dataset: {cfg.data.dataset} | vocab_size={vocab_size}")
-
-    # Update model config with actual vocab size using chz.replace()
+    # update the model config with the actual vocab size using chz.replace()
     model_cfg = chz.replace(cfg.model, vocab_size=vocab_size)
+    logger.info(f"Loaded dataset: {cfg.data.dataset} | vocab_size={vocab_size}")
 
-    # Model
+    # Initialize the model
     model = EBTLanguageModel(model_cfg, model_cfg).to(device)
     if cfg.train.compile:
         model = torch.compile(model)
 
-    # Optimizer
+    # Initialize the optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.train.learning_rate,
@@ -70,17 +72,17 @@ def main(cfg: Config):
         ckpt_path = cfg.load_checkpoint
         metadata = load_checkpoint(ckpt_path, model, optimizer)
         start_step = metadata["step"]
-        print(f"✓ Resumed from {ckpt_path} at step {start_step}")
+        logger.info(f"Resumed from {ckpt_path} at step {start_step}")
     else:
         latest_ckpt = get_latest_checkpoint(cfg.out_dir)
         if latest_ckpt:
             metadata = load_checkpoint(latest_ckpt, model, optimizer)
             start_step = metadata["step"]
-            print(f"✓ Resumed from {latest_ckpt} at step {start_step}")
+            logger.info(f"Resumed from {latest_ckpt} at step {start_step}")
 
     # Training loop
     model.train()
-    print(f"✓ Training from step {start_step} to {cfg.train.max_steps}")
+    logger.info(f"Training from step {start_step} to {cfg.train.max_steps}")
 
     for step, (x, y) in enumerate(train_loader, start=start_step):
         if step >= cfg.train.max_steps:
@@ -122,12 +124,15 @@ def main(cfg: Config):
 
         if step % cfg.train.log_interval == 0:
             logger.log_metrics(metrics, step=step)
-            print(f"step {step:5d} | loss {metrics['loss']:.3f} | lr {metrics['lr']:.2e}")
+            logger.info(f"Step {step:5d} | Loss {metrics['loss']:.3f} | Learning Rate {metrics['lr']:.2e}")
 
         # Checkpointing
         if cfg.save_interval > 0 and step > 0 and step % cfg.save_interval == 0:
-            ckpt_path = save_checkpoint(model, optimizer, step, cfg, cfg.out_dir)
-            print(f"✓ Saved checkpoint: {ckpt_path}")
+            # Save checkpoints with the effective model config (incl. actual vocab_size)
+            ckpt_path = save_checkpoint(
+                model, optimizer, step, chz.replace(cfg, model=model_cfg), cfg.out_dir
+            )
+            logger.info(f"Saved checkpoint: {ckpt_path}")
 
     # Save final checkpoint
     final_path = os.path.join(cfg.out_dir, "final.pt")
@@ -135,12 +140,13 @@ def main(cfg: Config):
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": cfg.train.max_steps,
-        "config": chz.asdict(cfg),
+        # Persist the effective model config (with actual vocab_size)
+        "config": chz.asdict(chz.replace(cfg, model=model_cfg)),
     }, final_path)
-    print(f"✓ Saved final model: {final_path}")
+    logger.info(f"Saved final model: {final_path}")
 
     logger.close()
-    print("✓ Training complete")
+    logger.info("Training complete")
 
 
 if __name__ == "__main__":

@@ -45,11 +45,19 @@ class Logger:
                     config=cfg_for_wandb,
                     dir=log_dir,
                 )
-                print(f"✓ Initialized wandb: {wandb_project}/{wandb_name}")
+                self.info(f"Initialized wandb: {wandb_project}/{wandb_name}")
             except ImportError:
-                print("⚠ wandb not installed, skipping wandb logging")
+                self.warning("wandb not installed, skipping wandb logging")
             except Exception as e:
-                print(f"⚠ Failed to initialize wandb: {e}")
+                self.warning(f"Failed to initialize wandb: {e}")
+
+    def info(self, message: str):
+        """Print info message with checkmark"""
+        print(f"✓ {message}")
+
+    def warning(self, message: str):
+        """Print warning message"""
+        print(f"⚠ {message}")
 
     def log_metrics(self, metrics: Dict[str, Any], step: int):
         """Log metrics to both file and wandb"""
@@ -112,7 +120,11 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> Dict[str, Any]:
     """Load checkpoint and return metadata"""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # Prefer safe loading; fall back if torch version doesn't support it
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     model.load_state_dict(checkpoint["model"])
     if optimizer and "optimizer" in checkpoint:

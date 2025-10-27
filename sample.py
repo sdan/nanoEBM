@@ -1,36 +1,90 @@
-# sample.py
+"""sample a nanoEBM model
+
+Usage:
+    python sample.py --checkpoint=out_ebt/ckpt_step_1000.pt
+    python sample.py --checkpoint=out_ebt/final.pt --max_new_tokens=500 --prompt="HAMLET:"
+    python sample.py --checkpoint=out_ebt/ckpt_step_1000.pt --use_thinking=True --think_steps=4 --topk=64
+"""
+import chz
 import torch
 from nanoebm.config import ModelConfig
 from nanoebm.model import EBTLanguageModel
 from nanoebm.data import CharDataset
 
+
+@chz.chz
+class SampleConfig:
+    """Configuration for sampling from a trained nanoEBM model"""
+    checkpoint: str = "out_ebt/final.pt"  # Path to checkpoint file
+    data_path: str = "shakespeare.txt"  # Path to training data (for vocab)
+    prompt: str = "ROMEO:"  # Text prompt to start generation
+    max_new_tokens: int = 200  # Number of tokens to generate
+    
+    # Thinking/refinement parameters
+    use_thinking: bool = False  # Whether to use iterative refinement
+    think_steps: int = 4  # Number of refinement steps (if use_thinking=True)
+    think_lr: float = 1.0  # Learning rate for refinement
+    think_tau: float = 1.0  # Temperature for softmax
+    think_noise: float = 0.0  # Noise level for Langevin dynamics
+    topk: int | None = None  # Restrict to top-k tokens (None = use all vocab)
+
+
 @torch.no_grad()
 def decode(idx, itos):
     return "".join(itos[i] for i in idx.tolist())
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ckpt = torch.load("nanoebm.pt", map_location=device)
-    model_cfg = ModelConfig(**ckpt["gcfg"])
+def main(cfg: SampleConfig):
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
+    print(f"Loading checkpoint: {cfg.checkpoint}")
+
+    ckpt = torch.load(cfg.checkpoint, map_location=device, weights_only=True)
+    model_cfg = ModelConfig(**ckpt["config"]["model"])
+
+    # Initialize model and load weights
     model = EBTLanguageModel(model_cfg, model_cfg).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"])  # shapes now match the checkpoint
     model.eval()
 
-    ds = CharDataset("shakespeare.txt", block_size=model_cfg.block_size, split="train")
+    print(f"Loaded model from step {ckpt['step']}")
+
+    # Load dataset for vocabulary and decoding
+    ds = CharDataset(cfg.data_path, block_size=model_cfg.block_size, split="train")
     stoi, itos = ds.stoi, ds.itos
+    if len(stoi) != model_cfg.vocab_size:
+        print(
+            f"Warning: dataset vocab_size ({len(stoi)}) != model vocab_size ({model_cfg.vocab_size}). "
+            "Ensure you are using the same data file used for training."
+        )
 
-    # prompt
-    prompt = "ROMEO:"
-    idx = torch.tensor([[stoi[c] for c in prompt]], dtype=torch.long, device=device)
+    # Encode prompt
+    print(f"\nPrompt: {cfg.prompt!r}")
+    idx = torch.tensor([[stoi[c] for c in cfg.prompt]], dtype=torch.long, device=device)
 
-    # choose one:
-    out = model.generate_greedy(idx.clone(), max_new_tokens=200)
-    # or with thinking (e.g., 4 steps, top-k=64)
-    # out = model.generate_think(idx.clone(), max_new_tokens=200, steps=4, topk=64)
+    # Generate
+    if cfg.use_thinking:
+        print(f"Generating with thinking (steps={cfg.think_steps}, topk={cfg.topk})...")
+        out = model.generate_think(
+            idx.clone(),
+            max_new_tokens=cfg.max_new_tokens,
+            steps=cfg.think_steps,
+            lr=cfg.think_lr,
+            tau=cfg.think_tau,
+            noise=cfg.think_noise,
+            topk=cfg.topk,
+        )
+    else:
+        print("Generating greedily...")
+        out = model.generate_greedy(idx.clone(), max_new_tokens=cfg.max_new_tokens)
 
+    # Decode and print
     txt = decode(out[0], itos)
+    print("\n" + "="*80)
     print(txt)
+    print("="*80)
+
 
 if __name__ == "__main__":
-    main()
+    config = chz.entrypoint(SampleConfig)
+    main(config)

@@ -31,7 +31,7 @@
     "warmup_iters": 2000,
     "lr_decay_iters": 100000,
     "min_lr": 3e-05,
-    "max_steps": 5000,
+    "max_steps": 1000,
     "grad_accum_steps": 1,
     "eval_interval": 500,
     "eval_iters": 50,

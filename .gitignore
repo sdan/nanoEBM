@@ -1,5 +1,6 @@
 # Outputs and checkpoints
 out/
+out_ebt/
 bench_log/
 
 # Data
