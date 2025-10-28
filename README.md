@@ -18,3 +18,7 @@ commands to run:
 ```bash
 uv sync
 uv run python train.py model.mcmc_num_steps=2 model.truncate_mcmc=True model.no_mcmc_detach=False model.mcmc_step_size_learnable=True
+
+
+uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=true think_steps=4 topk=64 sample=true sample_temp=1.2 sample_top_p=0.9
+```

@@ -18,9 +18,37 @@ from nanoebm.model import EBTLanguageModel, ContextTransformer
 from nanoebm.data import CharDataset, get_loader
 
 
+def find_latest_checkpoint(base_dir: str = "out_ebt") -> str:
+    """Find the latest checkpoint by looking for the newest run_* directory."""
+    import os
+    import glob
+
+    # Look for run_* directories
+    run_dirs = glob.glob(os.path.join(base_dir, "run_*"))
+    if not run_dirs:
+        raise FileNotFoundError(f"No run_* directories found in {base_dir}")
+
+    # Sort by modification time (newest first)
+    run_dirs.sort(key=os.path.getmtime, reverse=True)
+    latest_dir = run_dirs[0]
+
+    # Check for final.pt in the latest directory
+    checkpoint_path = os.path.join(latest_dir, "final.pt")
+    if os.path.exists(checkpoint_path):
+        return checkpoint_path
+
+    # Fallback: look for any .pt file in the latest directory
+    pt_files = glob.glob(os.path.join(latest_dir, "*.pt"))
+    if pt_files:
+        pt_files.sort(key=os.path.getmtime, reverse=True)
+        return pt_files[0]
+
+    raise FileNotFoundError(f"No .pt files found in {latest_dir}")
+
+
 @chz.chz
 class VizConfig:
-    checkpoint: str = "out_ebt/final.pt"
+    checkpoint: str | None = None  # None = auto-detect latest
     data_path: str = "shakespeare.txt"
     prompt: str = "ROMEO:"
     topk: int = 20
@@ -821,9 +849,16 @@ def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
 def main(cfg: VizConfig):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
-    print(f"Loading checkpoint: {cfg.checkpoint}")
 
-    ckpt = torch.load(cfg.checkpoint, map_location=device, weights_only=True)
+    # Auto-detect latest checkpoint if not specified
+    checkpoint = cfg.checkpoint
+    if checkpoint is None:
+        checkpoint = find_latest_checkpoint()
+        print(f"Auto-detected latest checkpoint: {checkpoint}")
+    else:
+        print(f"Loading checkpoint: {checkpoint}")
+
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
     model_cfg = ModelConfig(**ckpt["config"]["model"]) if "config" in ckpt else ModelConfig()
     model = EBTLanguageModel(model_cfg, model_cfg).to(device)
     model.load_state_dict(ckpt["model"])  # load weights
