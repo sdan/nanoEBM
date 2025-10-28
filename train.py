@@ -15,6 +15,7 @@ import datetime
 import json
 import chz
 import torch
+import math
 from nanoebm.config import Config
 from nanoebm.model import EBTLanguageModel
 from nanoebm.data import get_loader
@@ -55,16 +56,31 @@ def main(cfg: Config):
         json.dump(chz.asdict(cfg), f, indent=2)
     logger.info(f"Saved config to {config_path}")
 
-    # Load the dataset
+    # Load the dataset (train + val). For parquet dirs, share vocab between splits.
     train_loader, train_ds = get_loader(
         cfg.data.data_path,
         cfg.data.block_size,
         cfg.data.batch_size,
-        "train"
+        "train",
+        tokenizer=cfg.data.tokenizer,
+        bpe_encoding=cfg.data.bpe_encoding,
+        max_shards=cfg.data.max_shards,
+    )
+    val_loader, val_ds = get_loader(
+        cfg.data.data_path,
+        cfg.data.block_size,
+        cfg.data.batch_size,
+        "val",
+        vocab=getattr(train_ds, "stoi", None),
+        tokenizer=cfg.data.tokenizer,
+        bpe_encoding=cfg.data.bpe_encoding,
+        max_shards=cfg.data.max_shards,
     )
     
     # Because we're not using BPE for character-level model we need to set the vocab size to the actual size of the dataset
-    vocab_size = len(train_ds.stoi)
+    vocab_size = getattr(train_ds, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = len(getattr(train_ds, "stoi", {}))
     # update the model config with the actual vocab size using chz.replace()
     model_cfg = chz.replace(cfg.model, vocab_size=vocab_size)
     logger.info(f"Loaded dataset: {cfg.data.dataset} | vocab_size={vocab_size}")
@@ -134,10 +150,14 @@ def main(cfg: Config):
     # Pretty, columnar console logging
     header_printed = False
     # (label, metrics_key, fmt, width)
+    # Choose bits metric label depending on tokenizer
+    bits_label = "bpb" if cfg.data.tokenizer == "char" else "bpt"
+
     table_cols = [
         ("step", "step", "d", 6),
         ("loss", "loss", ".3f", 8),
         ("ppl", "perplexity", ".3f", 7),
+        (bits_label, bits_label, ".3f", 7),
         ("lr", "lr", ".2e", 11),
         ("alpha", "alpha", ".3f", 8),
         ("Egap", "energy_gap", ".4f", 10),
@@ -174,6 +194,45 @@ def main(cfg: Config):
         for _, key, fmt, w in table_cols:
             cells.append(_fmt_cell(row_metrics.get(key), fmt, w))
         print(" ".join(cells))
+
+    # Helper to run validation
+    @torch.no_grad()
+    def run_validation(eval_iters: int = cfg.train.eval_iters):
+        model.eval()
+        losses = []
+        bits_list = []
+        it = iter(val_loader)
+        for _ in range(eval_iters):
+            try:
+                x, y = next(it)
+            except StopIteration:
+                it = iter(val_loader)
+                x, y = next(it)
+            x, y = x.to(device), y.to(device)
+            out = model(x, targets=y)
+            # Unpack
+            if isinstance(out, tuple) and len(out) == 3:
+                val_loss, logits, extras = out
+            elif isinstance(out, tuple):
+                val_loss = out[0]
+                logits = None
+                extras = {}
+            else:
+                val_loss = out
+                logits = None
+                extras = {}
+            losses.append(float(val_loss.detach().cpu()))
+            # Bits metric from main CE if available, else total loss
+            loss_for_bits = extras.get("loss_main", None)
+            if loss_for_bits is None:
+                loss_for_bits = float(val_loss.detach().cpu())
+            bits_list.append(float(loss_for_bits) / math.log(2))
+        import math as _m
+        mean_loss = sum(losses) / max(1, len(losses))
+        ppl = float(_m.exp(mean_loss)) if mean_loss < 20 else float('inf')
+        model.train()
+        mean_bits = sum(bits_list) / max(1, len(bits_list))
+        return mean_loss, ppl, mean_bits
 
     for step, (x, y) in enumerate(train_loader, start=start_step):
         if step >= cfg.train.max_steps:
@@ -225,6 +284,13 @@ def main(cfg: Config):
         for k in ("perplexity", "energy_gap", "initial_energy", "final_energy"):
             if k in extras:
                 metrics[k] = extras[k]
+        # Bits metric: bits-per-char (char tokenizer) or bits-per-token (BPE)
+        loss_for_bits = extras.get("loss_main", None)
+        if loss_for_bits is None:
+            # Use total loss for K==0 (or if extras missing); undo grad_accum scaling
+            loss_for_bits = float(metrics["loss"])  # already undo scale above
+        bits_value = float(loss_for_bits) / math.log(2)
+        metrics[bits_label] = bits_value
         # Track current alpha (step size)
         try:
             metrics["alpha"] = float(model.alpha.detach().clamp(min=1e-6).item())
@@ -237,6 +303,13 @@ def main(cfg: Config):
             # Pretty table row on console
             row = {**metrics, "step": step}
             _print_row(row)
+
+        # Periodic evaluation
+        if cfg.train.eval_interval > 0 and step > 0 and step % cfg.train.eval_interval == 0:
+            val_loss, val_ppl, val_bits = run_validation(cfg.train.eval_iters)
+            log_payload = {"val_loss": val_loss, "val_perplexity": val_ppl, f"val_{bits_label}": val_bits}
+            logger.log_metrics(log_payload, step=step)
+            logger.info(f"val @ step {step}: loss={val_loss:.3f} ppl={val_ppl:.3f} {bits_label}={val_bits:.3f}")
 
         # Checkpointing
         if cfg.save_interval > 0 and step > 0 and step % cfg.save_interval == 0:
