@@ -17,53 +17,72 @@ Project deps include `torch`, `numpy`, `matplotlib`, `tiktoken`, `pyarrow` in `p
 
 ## Data
 
-You can train on the included Shakespeare text (char-level), or a small subset of OpenFineWeb (BPE).
+**Recommended**: Use the full OpenFineWeb dataset for production training. Shakespeare is included for quick testing.
 
-- Option A: Shakespeare (already in repo)
-  - File: `shakespeare.txt`
+### Option A: OpenFineWeb (Recommended - Full Dataset)
 
-- Option B: OpenFineWeb subset (Parquet + BPE)
-  - ```bash
-    mkdir -p ~/data/fineweb_small && cd ~/data/fineweb_small
-    BASE=https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main
-    for i in $(seq -f %05g 0 3); do curl -L -o shard_${i}.parquet "$BASE/shard_${i}.parquet"; done
-    ```
+The FineWeb-Edu-100B dataset contains 1823 parquet shards (~100B tokens). Download with the included utility:
+
+```bash
+# Quick start: 10 shards (~550M tokens, ~6GB)
+python download_data.py -n 10 -w 4
+
+# Medium scale: 100 shards (~5.5B tokens, ~60GB)
+python download_data.py -n 100 -w 8
+
+# Full dataset: 1823 shards (~100B tokens, ~1TB)
+python download_data.py -n -1 -w 8
+```
+
+Data downloads to `~/data/openfineweb` by default (configurable with `-d`).
+
+### Option B: Shakespeare (Quick Testing)
+
+Included in the repo for quick char-level testing:
+- File: `shakespeare.txt`
+- Size: ~1MB
+- Tokens: ~1M characters
 
 ## Train
 
 Both char- and BPE-tokenized training are supported. Checkpoints and metrics write to `out_ebt/run_*`.
 
-- Char-level (baseline, no thinking)
-  - ```bash
-    uv run python train.py 
-    ```
+### Recommended: OpenFineWeb with BPE Tokenization
 
-- Char-level (with thinking)
+- Baseline (no thinking)
   - ```bash
     uv run python train.py \
-      model.mcmc_num_steps=2 \
-      model.truncate_mcmc=True \
-      model.no_mcmc_detach=False
-    ```
-
-- BPE (OpenFineWeb subset, baseline)
-  - ```bash
-    uv run python train.py \
-      data.data_path=~/data/fineweb_small \
+      data.data_path=~/data/openfineweb \
       data.tokenizer=gpt2 \
-      data.max_shards=4 \
+      data.max_shards=10 \
       model.mcmc_num_steps=0 \
       train.eval_interval=1000 \
       train.eval_iters=50 \
       train.max_steps=20000
     ```
 
-- BPE (with thinking)
+- With thinking (iterative refinement)
   - ```bash
     uv run python train.py \
-      data.data_path=~/data/fineweb_small \
+      data.data_path=~/data/openfineweb \
       data.tokenizer=gpt2 \
-      data.max_shards=4 \
+      data.max_shards=10 \
+      model.mcmc_num_steps=2 \
+      model.truncate_mcmc=True \
+      model.no_mcmc_detach=False \
+      train.max_steps=20000
+    ```
+
+### Quick Testing: Shakespeare (Char-level)
+
+- Baseline (no thinking)
+  - ```bash
+    uv run python train.py
+    ```
+
+- With thinking
+  - ```bash
+    uv run python train.py \
       model.mcmc_num_steps=2 \
       model.truncate_mcmc=True \
       model.no_mcmc_detach=False
@@ -79,43 +98,67 @@ Notes
 
 `sample.py` auto-detects char vs BPE from the checkpoint config. Use `tokenizer`/`bpe_encoding` to override if needed.
 
-- Char-level
-  - ```bash
-    uv run python sample.py checkpoint=out_ebt/final.pt max_new_tokens=300 prompt="HAMLET:"
-    ```
+### BPE (OpenFineWeb models)
 
-- BPE (auto-detected; requires `tiktoken`)
+- Basic generation
   - ```bash
-    uv run python sample.py checkpoint=out_ebt/final.pt max_new_tokens=128 prompt="The future of AI is"
-    ```
-
-- Thinking mode (iterative refinement)
-  - Greedy refinement only:
-    ```bash
-    uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=true think_steps=4 topk=64
-    ```
-  - With sampling controls (temperature / top-p):
-    ```bash
     uv run python sample.py \
       checkpoint=out_ebt/final.pt \
-      use_thinking=true think_steps=4 topk=64 \
-      sample=true sample_temp=1.2 sample_top_p=0.9
+      max_new_tokens=256 \
+      prompt="The future of AI is"
     ```
 
-Tips
-- `sample.py` will auto-pick the latest run under `out_ebt` if `checkpoint` is omitted.
-- For BPE, ensure `tiktoken` is installed (it is listed in project deps).
+- With thinking (iterative refinement)
+  - ```bash
+    uv run python sample.py \
+      checkpoint=out_ebt/final.pt \
+      use_thinking=true \
+      think_steps=4 \
+      topk=64 \
+      sample=true \
+      sample_temp=1.0 \
+      sample_top_p=0.95 \
+      prompt="In the year 2050,"
+    ```
+
+### Char-level (Shakespeare models)
+
+- Basic generation
+  - ```bash
+    uv run python sample.py \
+      checkpoint=out_ebt/final.pt \
+      max_new_tokens=300 \
+      prompt="HAMLET:"
+    ```
+
+- With thinking
+  - ```bash
+    uv run python sample.py \
+      checkpoint=out_ebt/final.pt \
+      use_thinking=true \
+      think_steps=4 \
+      topk=64 \
+      prompt="ROMEO:"
+    ```
+
+Tips:
+- `sample.py` will auto-pick the latest run under `out_ebt` if `checkpoint` is omitted
+- BPE models require `tiktoken` (included in project deps)
 
 ## Weights & Biases (optional)
 
 - Install and login
   - `uv pip install wandb`
   - `uv run wandb login`  (or set `WANDB_API_KEY=...`)
+
 - Enable in training
   - ```bash
     uv run python train.py \
-      data.data_path=~/data/fineweb_small data.tokenizer=gpt2 \
-      wandb_project=nanoebm wandb_name=baseline_k0
+      data.data_path=~/data/openfineweb \
+      data.tokenizer=gpt2 \
+      data.max_shards=10 \
+      wandb_project=nanoebm \
+      wandb_name=ofw_baseline_k0
     ```
 
 ## Outputs & Checkpoints
