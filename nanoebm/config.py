@@ -22,6 +22,27 @@ class ModelConfig:
     mcmc_step_size: float = 1.0
     mcmc_step_size_learnable: bool = False
     langevin_noise: float = 0.0
+    # Step size optimizer behavior
+    mcmc_step_size_lr_multiplier: float = 3.0
+    # MCMC loop stability/behavior toggles
+    no_mcmc_detach: bool = False
+    truncate_mcmc: bool = False
+    normalize_initial_condition: bool = True
+    denoising_initial_condition: str = "random_noise"  # random_noise | zeros
+    refine_last_position_only: bool = True  # train-time simplification (Phase 1)
+    clamp_update_max_change: float = 0.25  # per-step delta clamp in logit space (0 disables)
+    absolute_clamp: float = 6.0  # keep logits sane under bf16/AMP (0 disables)
+    soften_target_prob_dist: float = 0.0  # label smoothing over steps
+    entropy_reg_tau: float = 0.5  # optional entropy regularizer in step objective
+    # Auxiliary CE weight to directly teach the energy head via CE on -E
+    aux_ce_weight: float = 0.5
+    # Optional logging of expected energy trace across steps (mean over active positions)
+    log_expected_energy_trace: bool = False
+    # Optional randomized steps (off by default)
+    randomize_mcmc_num_steps: int = 0
+    randomize_mcmc_num_steps_min: int = 0
+    randomize_mcmc_num_steps_final_landscape: bool = False
+    randomize_mcmc_step_size_scale: float = 1.0
 
 
 @chz.chz

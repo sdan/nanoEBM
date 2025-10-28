@@ -1,16 +1,17 @@
 [project]
 name = "nanoebm"
 version = "0.1.0"
-description = "Minimal Energy-Based Transformer scaffolding for text reasoning (nanoEBM)"
+description = "energy-based transformer for text reasoning"
 readme = "README.md"
-requires-python = ">=3.10"
-authors = [{ name = "nanoebm" }]
+requires-python = ">=3.11"
+authors = [{ name = "sdan" }]
 dependencies = [
   "torch>=2.1.0",  # user environment may already have torch; this is informative
-  "numpy>=1.23",
+  "numpy>=2.0,<3",
+  "matplotlib>=3.9.0",
   "tiktoken>=0.5.0",
+  "chz",
 ]
 
 [tool.black]
 line-length = 100
-

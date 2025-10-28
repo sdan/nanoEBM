@@ -1,9 +1,12 @@
-"""sample a nanoEBM model
+"""sample nanoEBM
 
 Usage:
-    python sample.py --checkpoint=out_ebt/ckpt_step_1000.pt
-    python sample.py --checkpoint=out_ebt/final.pt --max_new_tokens=500 --prompt="HAMLET:"
-    python sample.py --checkpoint=out_ebt/ckpt_step_1000.pt --use_thinking=True --think_steps=4 --topk=64
+    python sample.py checkpoint=out_ebt/ckpt_step_1000.pt
+    python sample.py checkpoint=out_ebt/final.pt max_new_tokens=500 prompt="HAMLET:"
+    # Thinking mode (iterative refinement)
+    python sample.py checkpoint=out_ebt/ckpt_step_1000.pt use_thinking=true think_steps=4 topk=64
+    # Thinking + sampling (stabilizes and reduces repetition)
+    python sample.py checkpoint=out_ebt/final.pt use_thinking=true think_steps=4 topk=64 sample=true sample_temp=1.2 sample_top_p=0.9
 """
 import chz
 import torch
@@ -27,6 +30,10 @@ class SampleConfig:
     think_tau: float = 1.0  # Temperature for softmax
     think_noise: float = 0.0  # Noise level for Langevin dynamics
     topk: int | None = None  # Restrict to top-k tokens (None = use all vocab)
+    # Decoding controls (when use_thinking=True)
+    sample: bool = False  # Sample from refined logits instead of argmax
+    sample_temp: float = 1.0  # Sampling temperature
+    sample_top_p: float | None = None  # Nucleus sampling cutoff (e.g., 0.9)
 
 
 @torch.no_grad()
@@ -73,6 +80,9 @@ def main(cfg: SampleConfig):
             tau=cfg.think_tau,
             noise=cfg.think_noise,
             topk=cfg.topk,
+            sample=cfg.sample,
+            sample_temp=cfg.sample_temp,
+            sample_top_p=cfg.sample_top_p,
         )
     else:
         print("Generating greedily...")
