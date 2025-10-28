@@ -13,3 +13,8 @@ x_{t+1} = x_t - α ∇_x E(x) + noise
 an energy-based model is a model trained to minimize a function. if we train a transformer to minize a function it learns to reason about the input implicitly as we iterate
 
 this current implementation is character-level on shakespeare.txt with a block size of 256.
+
+commands to run:
+```bash
+uv sync
+uv run python train.py model.mcmc_num_steps=2 model.truncate_mcmc=True model.no_mcmc_detach=False model.mcmc_step_size_learnable=True

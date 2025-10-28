@@ -1,7 +1,4 @@
-"""minGPT (compact copy for nanoebm)
-
-Copied from core/transformer.py with minimal changes to serve as the
-backbone for the EBT skeleton.
+"""minimal transformer from karpathy/minGPT
 """
 
 import math
