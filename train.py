@@ -125,6 +125,21 @@ def main(cfg: Config):
     model.train()
     logger.info(f"Training from step {start_step} to {cfg.train.max_steps}")
 
+    # Print initial training configuration
+    print("\n" + "="*60)
+    print("Training Configuration")
+    print("="*60)
+    print(f"Steps:           {start_step:>6d} → {cfg.train.max_steps:>6d}")
+    print(f"LR warmup:       {cfg.train.warmup_iters:>6d} steps")
+    print(f"System 2 warmup: {cfg.model.warmup_steps_no_refine:>6d} steps (System 1 only)")
+    print(f"Learning rate:   {cfg.train.learning_rate:>10.2e} (base)")
+    print(f"Alpha (step):    {cfg.model.alpha_value:>10.3f} (fixed)")
+    print(f"Refine steps:    {cfg.model.refine_steps:>6d}")
+    print(f"Batch size:      {cfg.data.batch_size:>6d}")
+    print(f"Block size:      {cfg.data.block_size:>6d}")
+    print(f"Vocab size:      {vocab_size:>6d}")
+    print("="*60 + "\n")
+
     # Pretty, columnar console logging
     header_printed = False
     # (label, metrics_key, fmt, width)
