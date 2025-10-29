@@ -461,50 +461,64 @@ class EBTLanguageModel(nn.Module):
                         v = v + noise * torch.randn_like(v)
                     v.requires_grad_(True)
             else:
-                # Original factorized EnergyHead refinement
-                E = self.energy.energies_all_tokens(h_last.unsqueeze(1), self.wte_weight)[:, 0, :]  # (B,V)
+                # EnergyHead refinement; prefer mixture-aware objective when not using top-k truncation.
+                E_full = self.energy.energies_all_tokens(h_last.unsqueeze(1), self.wte_weight)[:, 0, :]  # (B,V)
                 if topk is not None:
-                    topE, topI = torch.topk(-E, k=topk, dim=-1)  # (B,K)
+                    # Retain original factorized relaxation when using top-k for efficiency.
+                    topE, topI = torch.topk(-E_full, k=topk, dim=-1)  # (B,K)
                     v = topE.clone()
                     cand_idx = topI  # (B,K)
-                else:
-                    v = (-E).clone()
-                    cand_idx = None
-
-                v = v.detach().requires_grad_(True)
-                for _k in range(steps):
-                    p = F.softmax(v / max(1e-6, float(temp)), dim=-1)  # (B,K) or (B,V)
-                    R = self.energy.token_features(self.wte_weight)  # (V,dE)
-                    if cand_idx is not None:
-                        R_sel = R[cand_idx]  # (B,K,dE)
-                    else:
-                        R_sel = R.unsqueeze(0).expand(p.size(0), -1, -1)  # (B,V,dE)
-                    c = self.energy.context_proj(h_last)  # (B,dE)
-                    e = torch.einsum("bk,bkd->bd", p, R_sel)  # (B,dE)
-                    if self.energy.use_token_bias:
-                        if cand_idx is not None:
+                    v = v.detach().requires_grad_(True)
+                    for _k in range(steps):
+                        p = F.softmax(v / max(1e-6, float(temp)), dim=-1)  # (B,K)
+                        R = self.energy.token_features(self.wte_weight)[cand_idx]  # (B,K,dE)
+                        c = self.energy.context_proj(h_last)  # (B,dE)
+                        e = torch.einsum("bk,bkd->bd", p, R)  # (B,dE)
+                        if self.energy.use_token_bias:
                             b_sel = self.energy.token_bias[cand_idx]  # (B,K)
                             b = torch.einsum("bk,bk->b", p, b_sel)
                         else:
-                            b = torch.einsum("bk,k->b", p, self.energy.token_bias)
-                    else:
-                        b = torch.zeros(p.size(0), device=v.device)
-
-                    E_relaxed = b - (c * e).sum(-1)  # (B,)
-                    H = -(p.clamp_min(1e-9) * (p.clamp_min(1e-9)).log()).sum(-1)  # (B,)
-                    J = E_relaxed - float(entropy) * H
-                    (g,) = torch.autograd.grad(J.sum(), v, retain_graph=False, create_graph=False)
-                    # Apply delta clamp for stability
-                    delta = -lr * g
-                    if clamp_change and clamp_change > 0.0:
-                        delta = delta.clamp(min=-clamp_change, max=clamp_change)
-                    v = (v + delta).detach()
-                    # Optional absolute clamp
-                    if abs_clamp and abs_clamp > 0.0:
-                        v = v.clamp(min=-abs_clamp, max=abs_clamp)
-                    if noise and noise > 0:
-                        v = v + noise * torch.randn_like(v)
-                    v.requires_grad_(True)
+                            b = torch.zeros(p.size(0), device=v.device)
+                        E_relaxed = b - (c * e).sum(-1)  # (B,)
+                        H = -(p.clamp_min(1e-9) * (p.clamp_min(1e-9)).log()).sum(-1)  # (B,)
+                        J = E_relaxed - float(entropy) * H
+                        (g,) = torch.autograd.grad(J.sum(), v, retain_graph=False, create_graph=False)
+                        delta = -lr * g
+                        if clamp_change and clamp_change > 0.0:
+                            delta = delta.clamp(min=-clamp_change, max=clamp_change)
+                        v = (v + delta).detach()
+                        if abs_clamp and abs_clamp > 0.0:
+                            v = v.clamp(min=-abs_clamp, max=abs_clamp)
+                        if noise and noise > 0:
+                            v = v + noise * torch.randn_like(v)
+                        v.requires_grad_(True)
+                else:
+                    v = (-E_full).clone()
+                    cand_idx = None
+                    v = v.detach().requires_grad_(True)
+                    for _k in range(steps):
+                        p = F.softmax(v / max(1e-6, float(temp)), dim=-1)  # (B,V)
+                        # Mixture-aware recomputation of energies per step
+                        Emix = self.energy.energies_with_mixture(
+                            h_last.unsqueeze(1), self.wte_weight, p.unsqueeze(1)
+                        )[:, 0, :]  # (B,V)
+                        Ebar = (p * Emix).sum(dim=-1).mean()
+                        if float(entropy) != 0.0:
+                            p_safe = p.clamp_min(1e-9)
+                            H = -(p_safe * p_safe.log()).sum(dim=-1).mean()
+                            J = Ebar - float(entropy) * H
+                        else:
+                            J = Ebar
+                        (g,) = torch.autograd.grad(J, v, retain_graph=False, create_graph=False)
+                        delta = -lr * g
+                        if clamp_change and clamp_change > 0.0:
+                            delta = delta.clamp(min=-clamp_change, max=clamp_change)
+                        v = (v + delta).detach()
+                        if abs_clamp and abs_clamp > 0.0:
+                            v = v.clamp(min=-abs_clamp, max=abs_clamp)
+                        if noise and noise > 0:
+                            v = v + noise * torch.randn_like(v)
+                        v.requires_grad_(True)
 
             if sample:
                 # Sample from refined distribution with optional temperature and top-p
