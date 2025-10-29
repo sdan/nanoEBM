@@ -212,9 +212,10 @@ def main(cfg: Config):
 
         # Optimizer step (every grad_accum_steps)
         grad_step = (step + 1) % cfg.train.grad_accum_steps == 0
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip * grad_step)
-        optimizer.step() if grad_step else None
-        optimizer.zero_grad(set_to_none=True) if grad_step else None
+        if grad_step:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         # Logging (metrics dict persisted to JSONL/W&B)
         metrics["loss"] = loss.item() * cfg.train.grad_accum_steps

@@ -60,6 +60,7 @@ class EBM(nn.Module):
         
         # This linear layer defines our energy function
         # E(hidden_state, token) = -hidden_state @ W[token]
+        # NOTE: No weight tying - energy head needs its own parameters for proper energy landscape
         self.energy_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         # Fixed step size for gradient descent (not learned, following EBT)
@@ -68,15 +69,14 @@ class EBM(nn.Module):
         # Store previous predictions to warm-start gradient descent
         self.replay_buffer = ReplayBuffer(max_size=1000)
         
+        # Initialize weights (energy head gets special initialization)
         self.apply(self._init_weights)
-        
-        # Weight tying: energy head shares weights with token embeddings
-        self.energy_head.weight = self.transformer.transformer.wte.weight
     
     def _init_weights(self, module):
-        """Initialize weights for energy head."""
+        """Initialize weights for energy head with larger scale for meaningful gradients."""
         if isinstance(module, nn.Linear) and module == self.energy_head:
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            # Initialize with larger scale for more meaningful energy landscape
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.1)
     
     def get_hidden_states(self, idx: torch.Tensor) -> torch.Tensor:
         """Extract hidden states from transformer."""
@@ -170,18 +170,16 @@ class EBM(nn.Module):
             # Current probability distribution
             probs = F.softmax(logits, dim=-1)
             
-            # We want to MAXIMIZE expected logits (which minimizes expected energy)
-            # Since logits = -energy, maximizing logits minimizes energy
-            # Expected logits under current distribution
-            expected_logits = (probs * logits).sum(dim=-1).mean()
+            # Get energy values from the energy head
+            energies = self.energy_head(h)  # (B, T, V)
             
-            # To maximize, we need the negative of the loss
-            # We want gradient ASCENT on expected_logits
-            loss = -expected_logits
+            # Expected energy under current distribution: E_p[E(x,y)]
+            # We want to MINIMIZE this
+            expected_energy = (probs * energies).sum(dim=-1).mean()
             
             # Gradient with create_graph=True for second-order gradients during training
             grad = torch.autograd.grad(
-                loss,  # Minimize negative expected logits = maximize expected logits
+                expected_energy,  # Minimize expected energy
                 logits, 
                 create_graph=self.training  # Key change for trainable thinking
             )[0]
@@ -209,17 +207,17 @@ class EBM(nn.Module):
             if return_trajectory:
                 trajectory.append(logits.clone())
             
-            # Early stopping based on convergence (tracking expected logits)
-            current_expected_logits = expected_logits.detach().item()
+            # Early stopping based on energy convergence
+            current_energy = expected_energy.detach().item()
             if prev_energy is not None:
-                change = abs(prev_energy - current_expected_logits)
-                if change < self.config.energy_convergence_threshold:
+                energy_change = abs(prev_energy - current_energy)
+                if energy_change < self.config.energy_convergence_threshold:
                     early_stop_patience += 1
                     if early_stop_patience >= 2:  # Stop if converged for 2 steps
                         break
                 else:
                     early_stop_patience = 0
-            prev_energy = current_expected_logits
+            prev_energy = current_energy
         
         # Remember this refined prediction for future warm-starts
         if self.training and T == self.config.block_size:
