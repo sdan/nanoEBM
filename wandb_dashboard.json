@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "name": "nanoEBM Training Dashboard",
+  "description": "Comprehensive dashboard for monitoring Energy-Based Model training with System 1/2 dynamics",
+  "panels": [
+    {
+      "type": "line",
+      "title": "Loss & Perplexity",
+      "x_axis": "Step",
+      "y_axis": "Value",
+      "smoothing_weight": 0.6,
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "metrics": [
+        {
+          "expression": "loss",
+          "label": "Loss",
+          "color": "#1f77b4"
+        },
+        {
+          "expression": "perplexity",
+          "label": "Perplexity",
+          "color": "#ff7f0e",
+          "y_axis": "right"
+        }
+      ]
+    },
+    {
+      "type": "line",
+      "title": "Energy Dynamics",
+      "x_axis": "Step",
+      "y_axis": "Energy",
+      "smoothing_weight": 0.3,
+      "layout": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "metrics": [
+        {
+          "expression": "initial_energy",
+          "label": "E₀ (System 1)",
+          "color": "#2ca02c"
+        },
+        {
+          "expression": "final_energy",
+          "label": "Eₖ (System 2)",
+          "color": "#d62728"
+        },
+        {
+          "expression": "energy_gap",
+          "label": "Energy Gap (E₀ - Eₖ)",
+          "color": "#9467bd",
+          "y_axis": "right"
+        }
+      ]
+    },
+    {
+      "type": "line",
+      "title": "Learning Rate Schedule",
+      "x_axis": "Step",
+      "y_axis": "Learning Rate",
+      "smoothing_weight": 0,
+      "layout": {
+        "x": 0,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "metrics": [
+        {
+          "expression": "lr",
+          "label": "Learning Rate",
+          "color": "#8c564b"
+        }
+      ]
+    },
+    {
+      "type": "line",
+      "title": "Refinement Step Size (α)",
+      "x_axis": "Step",
+      "y_axis": "Alpha",
+      "smoothing_weight": 0.3,
+      "layout": {
+        "x": 8,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "metrics": [
+        {
+          "expression": "alpha",
+          "label": "Alpha (GD Step Size)",
+          "color": "#e377c2"
+        }
+      ]
+    },
+    {
+      "type": "line",
+      "title": "Training Speed",
+      "x_axis": "Step",
+      "y_axis": "Time (seconds)",
+      "smoothing_weight": 0.6,
+      "layout": {
+        "x": 16,
+        "y": 8,
+        "w": 8,
+        "h": 6
+      },
+      "metrics": [
+        {
+          "expression": "time/forward",
+          "label": "Forward Pass",
+          "color": "#7f7f7f"
+        },
+        {
+          "expression": "time/backward",
+          "label": "Backward Pass",
+          "color": "#bcbd22"
+        }
+      ]
+    },
+    {
+      "type": "scalar",
+      "title": "Current Metrics",
+      "layout": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 4
+      },
+      "metrics": [
+        {
+          "expression": "loss",
+          "label": "Loss",
+          "format": ".4f"
+        },
+        {
+          "expression": "perplexity",
+          "label": "Perplexity",
+          "format": ".3f"
+        },
+        {
+          "expression": "energy_gap",
+          "label": "Energy Gap",
+          "format": ".5f"
+        },
+        {
+          "expression": "alpha",
+          "label": "Alpha",
+          "format": ".4f"
+        },
+        {
+          "expression": "lr",
+          "label": "LR",
+          "format": ".2e"
+        }
+      ]
+    },
+    {
+      "type": "line",
+      "title": "Energy Gap Trend",
+      "x_axis": "Step",
+      "y_axis": "Energy Gap",
+      "smoothing_weight": 0.8,
+      "layout": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 6
+      },
+      "metrics": [
+        {
+          "expression": "energy_gap",
+          "label": "Energy Gap (smoothed)",
+          "color": "#17becf"
+        }
+      ]
+    },
+    {
+      "type": "histogram",
+      "title": "Energy Gap Distribution",
+      "layout": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 6
+      },
+      "metrics": [
+        {
+          "expression": "energy_gap",
+          "label": "Energy Gap"
+        }
+      ]
+    }
+  ]
+}

@@ -16,9 +16,15 @@ Usage examples:
 
 from __future__ import annotations
 
+import os
+# Set matplotlib backend before importing pyplot to avoid backend issues
+os.environ['MPLBACKEND'] = 'Agg'
+
 import chz
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -93,51 +99,74 @@ def _encode_prompt(ds: CharDataset, prompt: str, device: str):
 
 def _think_trace_last(model: EBM, idx: torch.Tensor, steps: int):
     """
-    Get energy and logit trajectories for the last position using EBM's system2_refine.
+    Get energy and logit trajectories using EBM's system2_refine.
     Returns (energy_trace, logit_trajectories, grad_norms)
     """
     device = idx.device
     B = idx.shape[0]
-    
-    # Get initial logits from System 1
-    with torch.no_grad():
-        # Get transformer output for last position
-        idx_cond = idx[:, -model.config.block_size:]
-        h = model.transformer(idx_cond)[:, -1:, :]  # (B, 1, n_embd)
-        
-        # Get initial energy from System 1
-        initial_energy = model.system1_direct_energy(h)  # (B, 1, vocab_size)
-        initial_logits = -initial_energy[:, 0, :]  # (B, vocab_size)
-    
+
+    # Truncate to block size
+    idx_cond = idx[:, -model.config.block_size:]
+
     # Run System 2 refinement with trajectory tracking
-    refined_logits, trajectory = model.system2_refine(
-        initial_logits, 
-        h[:, 0, :],  # (B, n_embd)
+    refined_logits = model.system2_refine(
+        idx_cond,
         steps=steps,
         return_trajectory=True
     )
-    
-    # Extract energy and gradient info from trajectory
+
+    # Check if we got a trajectory or just final logits
+    if isinstance(refined_logits, tuple):
+        refined_logits, trajectory = refined_logits
+    else:
+        trajectory = refined_logits
+
+    # Get energy values for computing expected energy
+    with torch.no_grad():
+        h = model.get_hidden_states(idx_cond)  # (B, T, n_embd)
+        energies = model.energy_head(h)  # (B, T, V)
+        last_energies = energies[:, -1, :]  # (B, V)
+
+    # Extract energy trace from trajectory
     energy_trace = []
     logit_trajs = []
     grad_norms = []
-    
-    for step_logits in trajectory:
-        # Compute expected energy for this step
-        probs = F.softmax(step_logits, dim=-1)
-        step_energy = model.energy_head(h)  # (B, 1, vocab_size)
-        expected_energy = (probs * step_energy[:, 0, :]).sum(dim=-1).mean()
-        energy_trace.append(float(expected_energy.cpu()))
-        
-        # Store logits for B=1 case (for visualization)
+
+    # Handle different trajectory formats
+    if isinstance(trajectory, list):
+        # List of logit tensors
+        for step_logits in trajectory:
+            # Get last position logits
+            if step_logits.dim() == 3:  # (B, T, V)
+                step_logits_last = step_logits[:, -1, :]
+            else:  # (B, V)
+                step_logits_last = step_logits
+
+            # Compute expected energy
+            probs = F.softmax(step_logits_last, dim=-1)
+            expected_energy = (probs * last_energies).sum(dim=-1).mean()
+            energy_trace.append(float(expected_energy.cpu()))
+
+            # Store logits for B=1 case
+            if B == 1:
+                logit_trajs.append(step_logits_last[0].detach().cpu())
+    elif trajectory.dim() == 3:  # Single tensor (B, T, V)
+        # Use last position only
+        last_logits = trajectory[:, -1, :]
+        probs = F.softmax(last_logits, dim=-1)
+        expected_energy = (probs * last_energies).sum(dim=-1).mean()
+        energy_trace = [float(expected_energy.cpu())]
         if B == 1:
-            logit_trajs.append(step_logits[0].detach().cpu())
-        
-        # Compute gradient norm (approximation)
-        if len(energy_trace) > 1:
-            grad_norm = abs(energy_trace[-1] - energy_trace[-2]) / float(model.alpha.item())
-            grad_norms.append(grad_norm)
-    
+            logit_trajs = [last_logits[0].detach().cpu()]
+
+    # Compute gradient norms if we have multiple steps
+    for i in range(1, len(energy_trace)):
+        if hasattr(model, 'alpha'):
+            grad_norm = abs(energy_trace[i] - energy_trace[i-1]) / float(model.alpha.item())
+        else:
+            grad_norm = abs(energy_trace[i] - energy_trace[i-1])
+        grad_norms.append(grad_norm)
+
     return energy_trace, logit_trajs, grad_norms
 
 
@@ -377,7 +406,18 @@ def main(cfg: VizConfig):
         print(f"Loading checkpoint: {checkpoint}")
 
     ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
-    model_cfg = ModelConfig(**ckpt["config"]["model"]) if "config" in ckpt else ModelConfig()
+    
+    # Load config, filtering out removed parameters
+    if "config" in ckpt:
+        config_dict = ckpt["config"]["model"]
+        # Remove parameters that no longer exist in ModelConfig
+        removed_params = ['use_replay_buffer']
+        for param in removed_params:
+            config_dict.pop(param, None)
+        model_cfg = ModelConfig(**config_dict)
+    else:
+        model_cfg = ModelConfig()
+    
     model = EBM(model_cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
