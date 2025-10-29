@@ -1,4 +1,5 @@
-"""minimal transformer from karpathy/minGPT
+"""
+Minimal transformer from https://github.com/karpathy/minGPT/blob/37baab71b9abea1b76ab957409a1cc2fbfba8a26/mingpt/model.py#L78
 """
 
 import math

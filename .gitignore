@@ -18,3 +18,11 @@ venv/
 .DS_Store
 
 ref.md
+
+viz.py
+viz2.py
+viz3.py
+viz4
+simple_gpt_model.pt
+docs/
+viz/

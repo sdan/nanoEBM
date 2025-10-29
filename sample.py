@@ -53,10 +53,9 @@ class SampleConfig:
     max_new_tokens: int = 200  # Number of tokens to generate
     
     # EBM parameters
-    mode: str = "think"  # Sampling mode: 'fast' (System 1), 'think' (System 2), or 'adaptive'
+    mode: str = "think"  # Sampling mode: 'fast' (System 1), 'think' (System 2)
     think_steps: int = 4       # Number of refinement steps when thinking
     topk: int | None = 50      # Restrict to top-k tokens (None = use all vocab)
-    adaptive_threshold: float = 2.0  # Entropy threshold for adaptive mode
     
     # Sampling parameters
     sample: bool = False  # Sample from distribution vs greedy
@@ -127,47 +126,8 @@ def main(cfg: SampleConfig):
             use_thinking=True,
             think_steps=cfg.think_steps
         )
-    elif cfg.mode == "adaptive":
-        print(f"Generating with adaptive mode (entropy threshold={cfg.adaptive_threshold})...")
-        # Custom generation loop for adaptive mode
-        generated = idx.clone()
-        for _ in range(cfg.max_new_tokens):
-            # Crop context if needed
-            idx_cond = generated if generated.size(1) <= model.config.block_size else generated[:, -model.config.block_size:]
-            
-            # Get System 1 logits first
-            with torch.no_grad():
-                logits_s1 = model.system1_direct_energy(idx_cond)[:, -1, :]  # Last position
-                
-                # Calculate entropy to decide if we need System 2
-                probs = F.softmax(logits_s1, dim=-1)
-                entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1)
-                
-                # Use System 2 if entropy is high (uncertain)
-                if entropy.mean() > cfg.adaptive_threshold:
-                    logits = model.system2_refine(idx_cond, steps=cfg.think_steps)[:, -1, :]
-                else:
-                    logits = logits_s1
-                
-                # Apply temperature and top-k
-                logits = logits / (cfg.sample_temp if cfg.sample else 1.0)
-                if cfg.topk is not None:
-                    v, _ = torch.topk(logits, min(cfg.topk, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                
-                # Sample or greedy
-                probs = F.softmax(logits, dim=-1)
-                if cfg.sample:
-                    idx_next = torch.multinomial(probs, num_samples=1)
-                else:
-                    idx_next = probs.argmax(dim=-1, keepdim=True)
-                
-                # Append
-                generated = torch.cat((generated, idx_next), dim=1)
-        
-        out = generated
     else:
-        raise ValueError(f"Unknown mode: {cfg.mode}. Use 'fast', 'think', or 'adaptive'")
+        raise ValueError(f"Unknown mode: {cfg.mode}. Use 'fast', 'think'")
 
     # Decode and print
     txt = decode(out[0], itos)

@@ -1,6 +1,16 @@
 """
 EBM - Minimal Energy-Based Model
-A simplified implementation demonstrating System 1/System 2 thinking through energy-based refinement.
+
+Energy-Based Model for language, its based on:
+1. Yann LeCun's lecture on Energy-Based Models: https://atcold.github.io/NYU-DLSP20/en/week07/07-1/
+2. Stefano Ermon's CS236 Lecture 11: https://deepgenerativemodels.github.io/assets/slides/cs236_lecture11.pdf
+
+The model learns an energy function E(x, y) where low energy = good text.
+It has two modes:
+- System 1: Direct readout of energy (fast, like a regular LM)
+- System 2: Gradient descent on logits to minimize energy (slower but better)
+
+This is forced to reason vs thinking harder about the answer.
 """
 
 import torch
@@ -14,17 +24,7 @@ from .config import ModelConfig
 
 
 class EBM(nn.Module):
-    """
-    Energy-Based Model for language.
-    
-    The model learns an energy function E(x, y) where low energy = good text.
-    It has two modes:
-    - System 1: Direct readout of energy (fast, like a regular LM)
-    - System 2: Gradient descent on logits to minimize energy (slower but better)
-    
-    This is like having a quick intuition vs thinking harder about the answer.
-    """
-    
+    """Energy-Based Model from https://atcold.github.io/NYU-DLSP20/en/week07/07-1/"""    
     def __init__(self, config: ModelConfig):
         super().__init__()
         
@@ -126,7 +126,7 @@ class EBM(nn.Module):
         prev_energy = None
         early_stop_patience = 0
         
-        # Gradient descent loop - proper EBM objective
+        # Gradient descent loop
         for step in range(steps):
             # Current probability distribution
             probs = F.softmax(logits, dim=-1)  # (B, T, V)
@@ -143,14 +143,10 @@ class EBM(nn.Module):
                 create_graph=self.training  # Keep graph for trainable thinking
             )[0]
             
-            # Alternative: explicit gradient computation (more efficient)
-            # Ebar = (probs * energies).sum(dim=-1, keepdim=True)  # (B, T, 1)
-            # grad = probs * (energies - Ebar)  # (B, T, V)
-            
-            # Step size (small for stability)
+            # Step size
             step_size = self.alpha
             if self.training:
-                # Small jitter during training
+                # Small jitter during training 
                 jitter = 1.0 + 0.1 * (torch.rand(1, device=device) - 0.5)  # [0.95, 1.05]
                 step_size = step_size * jitter
             
@@ -229,11 +225,6 @@ class EBM(nn.Module):
             metrics['EE_s1'] = EE_s1.item()
             metrics['EE_s2'] = EE_s2.item()
             metrics['delta_EE'] = (EE_s1 - EE_s2).item()  # Should be positive
-            
-            # For backward compatibility
-            metrics['initial_energy'] = EE_s1.item()
-            metrics['final_energy'] = EE_s2.item()
-            metrics['energy_gap'] = metrics['delta_EE']
         else:
             logits = logits_s1
             metrics['EE_s1'] = EE_s1.item()
@@ -267,8 +258,6 @@ class EBM(nn.Module):
                     'delta_nll': (nll_s1 - nll_s2).item(),  # Should be positive
                 })
                 
-                # For backward compatibility
-                metrics['perplexity'] = metrics['ppl_s2']
             else:
                 loss = nll_s1
                 metrics.update({

@@ -1,3 +1,4 @@
+# From https://github.com/karpathy/minGPT/blob/37baab71b9abea1b76ab957409a1cc2fbfba8a26/projects/chargpt/chargpt.py#L42
 import torch
 from pathlib import Path
 
