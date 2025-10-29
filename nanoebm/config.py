@@ -16,9 +16,11 @@ class ModelConfig:
     dropout: float = 0.1
     bias: bool = True
 
-    # EBM refinement parameters
-    refine_steps: int = 2              # Number of refinement steps during training (0 = no refinement)
-    alpha_lr_multiplier: float = 3.0   # Learning rate multiplier for alpha parameter
+    # EBM refinement parameters (following EBT paper)
+    refine_steps: int = 4                    # Number of refinement steps during inference
+    alpha_value: float = 0.1                 # Fixed step size for gradient descent (not learned)
+    langevin_noise: float = 0.01            # Langevin noise scale during training
+    energy_convergence_threshold: float = 1e-4  # Threshold for early stopping based on energy
 
 
 @chz.chz

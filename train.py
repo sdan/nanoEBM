@@ -74,38 +74,13 @@ def main(cfg: Config):
     if cfg.train.compile:
         model = torch.compile(model)
 
-    # Initialize the optimizer with separate learning rates for alpha (refine step size)
-    base_lr = cfg.train.learning_rate
-    alpha_lr_multiplier = getattr(model_cfg, 'alpha_lr_multiplier', 3.0)
-    
-    # Separate parameters into alpha and non-alpha groups
-    alpha_params = []
-    other_params = []
-    for name, param in model.named_parameters():
-        if name == 'alpha':
-            alpha_params.append(param)
-        else:
-            other_params.append(param)
-    
-    # Build parameter groups with different learning rates
-    param_groups = []
-    
-    if other_params:
-        param_groups.append({
-            'params': other_params,
-            'lr': base_lr,
-            'betas': (cfg.train.beta1, cfg.train.beta2),
-            'weight_decay': cfg.train.weight_decay,
-        })
-    
-    if alpha_params:
-        param_groups.append({
-            'params': alpha_params,
-            'lr': base_lr * alpha_lr_multiplier,
-            'betas': (cfg.train.beta1, cfg.train.beta2),
-            'weight_decay': 0.0,  # No weight decay for alpha
-        })
-    optimizer = torch.optim.AdamW(param_groups)
+    # Initialize the optimizer (alpha is now fixed, not learned)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.train.learning_rate,
+        betas=(cfg.train.beta1, cfg.train.beta2),
+        weight_decay=cfg.train.weight_decay
+    )
 
     # Resume from checkpoint if exists
     start_step = 0
@@ -195,12 +170,9 @@ def main(cfg: Config):
             cfg.train.min_lr,
         ) if cfg.train.decay_lr else cfg.train.learning_rate
 
-        # Respect LR multiplier for alpha group
-        for i, param_group in enumerate(optimizer.param_groups):
-            if i == 0:  # main params
-                param_group["lr"] = lr
-            else:  # alpha group (if present)
-                param_group["lr"] = lr * alpha_lr_multiplier
+        # Update learning rate
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         metrics["lr"] = lr
 
         # Forward pass
@@ -226,11 +198,8 @@ def main(cfg: Config):
         for k in ("perplexity", "energy_gap", "initial_energy", "final_energy"):
             if k in extras:
                 metrics[k] = extras[k]
-        # Track current alpha (step size)
-        try:
-            metrics["alpha"] = float(model.alpha.detach().clamp(min=1e-6).item())
-        except Exception:
-            pass
+        # Track current alpha (step size - now fixed)
+        metrics["alpha"] = float(model.alpha.item())
 
         if step % cfg.train.log_interval == 0:
             # Persist metrics

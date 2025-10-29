@@ -62,16 +62,13 @@ class EBM(nn.Module):
         # E(hidden_state, token) = -hidden_state @ W[token]
         self.energy_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-        # Fixed step size for gradient descent (not learned, following EBT)
-        self.register_buffer('alpha', torch.tensor(config.alpha_value))
+        # Step size for gradient descent (learned during training)
+        self.alpha = nn.Parameter(torch.tensor(0.1))
         
         # Store previous predictions to warm-start gradient descent
         self.replay_buffer = ReplayBuffer(max_size=1000)
         
         self.apply(self._init_weights)
-        
-        # Weight tying: energy head shares weights with token embeddings
-        self.energy_head.weight = self.transformer.transformer.wte.weight
     
     def _init_weights(self, module):
         """Initialize weights for energy head."""
@@ -111,53 +108,40 @@ class EBM(nn.Module):
     def system2_refine(
         self, 
         idx: torch.Tensor, 
-        steps: int = None,
+        steps: int = 3,
         return_trajectory: bool = False
     ) -> torch.Tensor:
         """
         System 2: Gradient descent on the logits to minimize energy.
         
-        Following EBT: trainable thinking with second-order gradients,
-        randomized steps, Langevin noise, and early stopping.
-        """
+        We start with initial logits and ask: "what logits would minimize 
+        the expected energy under the softmax distribution?"
+        Then we take gradient steps to find better logits.
+                """
         B, T = idx.shape
         V = self.config.vocab_size
         device = idx.device
         
-        # Get hidden states WITHOUT detaching (keep computation graph for training)
-        h = self.get_hidden_states(idx)  # (B, T, n_embd)
+        # Get hidden states (we'll reuse these, no need to recompute)
+        h = self.get_hidden_states(idx).detach()  # (B, T, n_embd)
         
-        # Randomize step count during training (EBT uses 2-3 steps)
-        if steps is None:
-            if self.training:
-                steps = random.randint(2, 3)
-            else:
-                steps = self.config.refine_steps
+        # Start with System 1's guess
+        logits = -self.energy_head(h)  # Initial logits
         
-        # Initialize logits
-        if self.training and random.random() < 0.5:
-            # Random initialization during training (helps exploration)
-            logits = 0.01 * torch.randn(B, T, V, device=device, requires_grad=True)
-        else:
-            # Start with System 1's guess
-            logits = -self.energy_head(h)
-            
-            # Maybe warm-start from replay buffer
-            if self.replay_buffer.has_samples() and self.training:
-                sample = self.replay_buffer.sample(1)
-                if sample is not None and sample.shape[-2:] == (T, V):
-                    logits = sample[0].to(device).expand(B, T, V).clone()
-                    logits = logits + 0.01 * torch.randn_like(logits)
+        # Maybe warm-start from a previous similar prediction
+        if self.replay_buffer.has_samples() and self.training:
+            sample = self.replay_buffer.sample(1)
+            if sample is not None and sample.shape[-2:] == (T, V):
+                logits = sample[0].to(device).expand(B, T, V).clone()
+                logits = logits + 0.01 * torch.randn_like(logits)  # Add noise
+            # If sample doesn't match, we already have logits from System 1 above
         
-        logits = logits.requires_grad_(True)
         trajectory = [logits.clone()] if return_trajectory else []
         
-        # Track energy for early stopping
-        prev_energy = None
-        early_stop_patience = 0
-        
-        # Gradient descent loop with EBT improvements
+        # Gradient descent loop: improve logits to minimize expected energy
         for step in range(steps):
+            logits = logits.detach().requires_grad_(True)
+            
             # Current probability distribution
             probs = F.softmax(logits, dim=-1)
             
@@ -165,54 +149,24 @@ class EBM(nn.Module):
             energies = self.energy_head(h)
             
             # Expected energy: E_p[E(x,y)] = sum_y p(y) * E(x,y)
-            # Take mean over batch and sequence dimensions
-            expected_energy = (probs * energies).sum(dim=-1).mean()
+            expected_energy = (probs * energies).sum()
             
-            # Gradient with create_graph=True for second-order gradients during training
-            grad = torch.autograd.grad(
-                expected_energy, 
-                logits, 
-                create_graph=self.training  # Key change for trainable thinking
-            )[0]
+            # Gradient tells us how to change logits to reduce expected energy
+            grad = torch.autograd.grad(expected_energy, logits)[0]
             
-            # Step size with jitter during training (EBT uses multiplicative noise)
-            step_size = self.alpha
-            if self.training:
-                jitter = 1.0 + 0.5 * (torch.rand(1, device=device) - 0.5)  # [0.75, 1.25]
-                step_size = step_size * jitter
-            
-            # Take gradient descent step
+            # Take a gradient descent step
+            step_size = self.alpha.clamp(min=1e-6, max=1.0)
             logits = logits - step_size * grad.clamp(-5, 5)
-            
-            # Add Langevin noise during training (helps exploration)
-            if self.training:
-                noise_scale = self.config.langevin_noise * (1.0 - step / steps)  # Decay noise
-                logits = logits + noise_scale * torch.randn_like(logits)
             
             # Center logits (doesn't change softmax, helps stability)
             logits = logits - logits.mean(dim=-1, keepdim=True)
             
-            # Make logits require grad for next iteration
-            logits = logits.requires_grad_(True)
-            
             if return_trajectory:
                 trajectory.append(logits.clone())
-            
-            # Early stopping based on energy convergence
-            current_energy = expected_energy.detach().item()
-            if prev_energy is not None:
-                energy_change = abs(prev_energy - current_energy)
-                if energy_change < self.config.energy_convergence_threshold:
-                    early_stop_patience += 1
-                    if early_stop_patience >= 2:  # Stop if converged for 2 steps
-                        break
-                else:
-                    early_stop_patience = 0
-            prev_energy = current_energy
         
         # Remember this refined prediction for future warm-starts
         if self.training and T == self.config.block_size:
-            self.replay_buffer.add(logits[0].detach())
+            self.replay_buffer.add(logits[0])
         
         if return_trajectory:
             return logits, trajectory
