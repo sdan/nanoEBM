@@ -11,7 +11,7 @@ Usage:
 import chz
 import torch
 from nanoebm.config import ModelConfig
-from nanoebm.model import EBTLanguageModel
+from nanoebm.model import EBM
 from nanoebm.data import CharDataset
 
 
@@ -45,24 +45,20 @@ def find_latest_checkpoint(base_dir: str = "out_ebt") -> str:
 
 @chz.chz
 class SampleConfig:
-    """Configuration for sampling from a trained nanoEBM model"""
+    """Configuration for sampling from a trained EBM model"""
     checkpoint: str | None = None  # None = auto-detect latest checkpoint
     data_path: str = "shakespeare.txt"  # Path to training data (for vocab)
     prompt: str = "ROMEO:"  # Text prompt to start generation
     max_new_tokens: int = 200  # Number of tokens to generate
     
-    # Thinking/refinement parameters
-    use_thinking: bool = True  # Default to thinking mode (always refine)
-    think_steps: int = 4       # Number of refinement steps
-    think_lr: float = 0.5      # Step size for refinement
-    softmax_temperature: float = 1.0  # τ for softmax during refinement
-    entropy_weight: float = 0.1       # λ in J = E_p[E] - λ H(p)
-    think_noise: float = 0.0   # Noise level for Langevin dynamics
+    # EBM parameters
+    use_thinking: bool = True  # Use System 2 refinement (True) or System 1 fast mode (False)
+    think_steps: int = 4       # Number of refinement steps when thinking
     topk: int | None = 50      # Restrict to top-k tokens (None = use all vocab)
-    # Decoding controls (when use_thinking=True)
-    sample: bool = False  # Sample from refined logits instead of argmax
-    sample_temp: float = 1.0  # Sampling temperature
-    sample_top_p: float | None = None  # Nucleus sampling cutoff (e.g., 0.9)
+    
+    # Sampling parameters
+    sample: bool = False  # Sample from distribution vs greedy
+    sample_temp: float = 1.0  # Temperature for sampling
 
 
 @torch.no_grad()
@@ -86,7 +82,7 @@ def main(cfg: SampleConfig):
     model_cfg = ModelConfig(**ckpt["config"]["model"])
 
     # Initialize model and load weights
-    model = EBTLanguageModel(model_cfg, model_cfg).to(device)
+    model = EBM(model_cfg).to(device)
     model.load_state_dict(ckpt["model"])  # shapes now match the checkpoint
     model.eval()
 
@@ -108,22 +104,22 @@ def main(cfg: SampleConfig):
     # Generate
     if cfg.use_thinking:
         print(f"Generating with thinking (steps={cfg.think_steps}, topk={cfg.topk})...")
-        out = model.generate_think(
+        out = model.generate(
             idx.clone(),
             max_new_tokens=cfg.max_new_tokens,
-            steps=cfg.think_steps,
-            lr=cfg.think_lr,
-            temp=cfg.softmax_temperature,
-            entropy=cfg.entropy_weight,
-            noise=cfg.think_noise,
-            topk=cfg.topk,
-            sample=cfg.sample,
-            sample_temp=cfg.sample_temp,
-            sample_top_p=cfg.sample_top_p,
+            temperature=cfg.sample_temp if cfg.sample else 1.0,
+            top_k=cfg.topk,
+            use_thinking=True,
+            think_steps=cfg.think_steps
         )
     else:
-        print("Generating greedily...")
-        out = model.generate_greedy(idx.clone(), max_new_tokens=cfg.max_new_tokens)
+        print("Generating without thinking (fast mode)...")
+        out = model.generate(
+            idx.clone(),
+            max_new_tokens=cfg.max_new_tokens,
+            temperature=1.0,
+            use_thinking=False
+        )
 
     # Decode and print
     txt = decode(out[0], itos)

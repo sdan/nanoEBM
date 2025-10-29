@@ -16,7 +16,7 @@ import json
 import chz
 import torch
 from nanoebm.config import Config
-from nanoebm.model import EBTLanguageModel
+from nanoebm.model import EBM
 from nanoebm.data import get_loader
 from nanoebm.utils import (
     Logger,
@@ -70,17 +70,13 @@ def main(cfg: Config):
     logger.info(f"Loaded dataset: {cfg.data.dataset} | vocab_size={vocab_size}")
 
     # Initialize the model
-    model = EBTLanguageModel(model_cfg, model_cfg).to(device)
+    model = EBM(model_cfg).to(device)
     if cfg.train.compile:
         model = torch.compile(model)
 
     # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
-    alpha_lr_multiplier = (
-        getattr(model_cfg, 'think_lr_lr_multiplier', None)
-        if getattr(model_cfg, 'think_lr_lr_multiplier', None) is not None
-        else getattr(model_cfg, 'refine_step_size_lr_multiplier', 3.0)
-    )
+    alpha_lr_multiplier = getattr(model_cfg, 'alpha_lr_multiplier', 3.0)
     
     # Separate parameters into alpha and non-alpha groups
     alpha_params = []
@@ -138,15 +134,20 @@ def main(cfg: Config):
     # Pretty, columnar console logging
     header_printed = False
     # (label, metrics_key, fmt, width)
+    # Simple, clear metrics that tell us what's happening:
+    # - loss/ppl: is the model learning?
+    # - lr/alpha: what are our step sizes?
+    # - energy gap: how much does thinking help? (should be positive)
+    # - E0/EK: energy before/after gradient descent
     table_cols = [
         ("step", "step", "d", 6),
         ("loss", "loss", ".3f", 8),
         ("ppl", "perplexity", ".3f", 7),
         ("lr", "lr", ".2e", 11),
-        ("alpha", "alpha", ".3f", 8),
-        ("Egap", "energy_gap", ".4f", 10),
-        ("E0", "initial_energy", ".4f", 10),
-        ("EK", "final_energy", ".4f", 10),
+        ("alpha", "alpha", ".3f", 8),  # gradient descent step size
+        ("Egap", "energy_gap", ".4f", 10),  # E0 - EK (improvement from thinking)
+        ("E0", "initial_energy", ".4f", 10),  # System 1 energy
+        ("EK", "final_energy", ".4f", 10),  # System 2 energy (after grad descent)
         ("t/fwd", "time/forward", ".3f", 8),
         ("t/bwd", "time/backward", ".3f", 8),
     ]
@@ -205,12 +206,8 @@ def main(cfg: Config):
         # Forward pass
         x, y = x.to(device), y.to(device)
         with timed("forward", metrics):
-            out = model(x, targets=y)
-            if isinstance(out, tuple) and len(out) == 3:
-                loss, logits, extras = out
-            else:
-                loss, logits = out
-                extras = {}
+            # EBM model returns (loss, logits, metrics)
+            loss, logits, extras = model(x, targets=y, use_refine=True, refine_steps=model_cfg.refine_steps)
             loss = loss / cfg.train.grad_accum_steps
 
         # Backward pass
