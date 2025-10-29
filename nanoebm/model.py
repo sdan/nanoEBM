@@ -116,10 +116,10 @@ class EBM(nn.Module):
         detach_hidden: bool = False
     ) -> torch.Tensor:
         """
-        System 2: Gradient descent on the logits to minimize energy.
+        System 2: Gradient descent on the logits to minimize expected energy.
         
-        Following EBT: trainable thinking with second-order gradients,
-        randomized steps, Langevin noise, and early stopping.
+        Implements proper EBM objective: minimize E_p[E(x,y)] where p = softmax(logits)
+        and E(x,y) comes from the learned energy head (fixed during refinement).
         
         Args:
             idx: Input tokens
@@ -131,77 +131,72 @@ class EBM(nn.Module):
         V = self.config.vocab_size
         device = idx.device
         
-        # Get hidden states - optionally detach for more stable early training
+        # Get hidden states and energy values (fixed for this refinement)
         h = self.get_hidden_states(idx)  # (B, T, n_embd)
         if detach_hidden:
             h = h.detach()
         
-        # Randomize step count during training (EBT uses 2-3 steps)
+        # Energy values are FIXED during refinement - this is key!
+        energies = self.energy_head(h)  # (B, T, V)
+        
+        # Determine number of steps
         if steps is None:
             if self.training:
                 steps = random.randint(2, 3)
             else:
                 steps = self.config.refine_steps
         
-        # Initialize logits
-        if self.training and random.random() < 0.5:
-            # Random initialization during training (helps exploration)
-            logits = 0.01 * torch.randn(B, T, V, device=device, requires_grad=True)
-        else:
-            # Start with System 1's guess
-            logits = -self.energy_head(h)
-            
-            # Maybe warm-start from replay buffer
-            if self.replay_buffer.has_samples() and self.training:
-                sample = self.replay_buffer.sample(1)
-                if sample is not None and sample.shape[-2:] == (T, V):
-                    logits = sample[0].to(device).expand(B, T, V).clone()
-                    logits = logits + 0.01 * torch.randn_like(logits)
-        
+        # Initialize logits from System 1 (stable initialization)
+        # Disable random init and replay buffer for now (stability)
+        logits = -energies.clone()  # S1 initialization
         logits = logits.requires_grad_(True)
+        
         trajectory = [logits.clone()] if return_trajectory else []
         
         # Track energy for early stopping
         prev_energy = None
         early_stop_patience = 0
         
-        # Gradient descent loop with EBT improvements
+        # Gradient descent loop - proper EBM objective
         for step in range(steps):
             # Current probability distribution
-            probs = F.softmax(logits, dim=-1)
-            
-            # Get energy values from the energy head
-            energies = self.energy_head(h)  # (B, T, V)
+            probs = F.softmax(logits, dim=-1)  # (B, T, V)
             
             # Expected energy under current distribution: E_p[E(x,y)]
-            # We want to MINIMIZE this
+            # This is what we minimize in EBM
             expected_energy = (probs * energies).sum(dim=-1).mean()
             
-            # Gradient with create_graph=True for second-order gradients during training
+            # Compute gradient of expected energy w.r.t. logits
+            # Using autograd for second-order gradients during training
             grad = torch.autograd.grad(
                 expected_energy,  # Minimize expected energy
                 logits, 
-                create_graph=self.training  # Key change for trainable thinking
+                create_graph=self.training  # Keep graph for trainable thinking
             )[0]
             
-            # Step size with jitter during training (EBT uses multiplicative noise)
+            # Alternative: explicit gradient computation (more efficient)
+            # Ebar = (probs * energies).sum(dim=-1, keepdim=True)  # (B, T, 1)
+            # grad = probs * (energies - Ebar)  # (B, T, V)
+            
+            # Step size (small for stability)
             step_size = self.alpha
             if self.training:
-                jitter = 1.0 + 0.5 * (torch.rand(1, device=device) - 0.5)  # [0.75, 1.25]
+                # Small jitter during training
+                jitter = 1.0 + 0.1 * (torch.rand(1, device=device) - 0.5)  # [0.95, 1.05]
                 step_size = step_size * jitter
             
-            # Take gradient descent step (on the loss, which maximizes expected logits)
+            # Gradient descent step
             logits = logits - step_size * grad.clamp(-5, 5)
             
-            # Add Langevin noise during training (helps exploration)
-            if self.training:
-                noise_scale = self.config.langevin_noise * (1.0 - step / steps)  # Decay noise
-                logits = logits + noise_scale * torch.randn_like(logits)
+            # Disable Langevin noise initially for stability
+            # if self.training and step < steps - 1:
+            #     noise_scale = self.config.langevin_noise * (1.0 - step / steps)
+            #     logits = logits + noise_scale * torch.randn_like(logits)
             
-            # Center logits (doesn't change softmax, helps stability)
+            # Center logits for numerical stability
             logits = logits - logits.mean(dim=-1, keepdim=True)
             
-            # Make logits require grad for next iteration
+            # Prepare for next iteration
             logits = logits.requires_grad_(True)
             
             if return_trajectory:
@@ -213,15 +208,15 @@ class EBM(nn.Module):
                 energy_change = abs(prev_energy - current_energy)
                 if energy_change < self.config.energy_convergence_threshold:
                     early_stop_patience += 1
-                    if early_stop_patience >= 2:  # Stop if converged for 2 steps
+                    if early_stop_patience >= 2:
                         break
                 else:
                     early_stop_patience = 0
             prev_energy = current_energy
         
-        # Remember this refined prediction for future warm-starts
-        if self.training and T == self.config.block_size:
-            self.replay_buffer.add(logits[0].detach())
+        # Disable replay buffer initially for stability
+        # if self.training and T == self.config.block_size:
+        #     self.replay_buffer.add(logits[0].detach())
         
         if return_trajectory:
             return logits, trajectory
@@ -237,6 +232,8 @@ class EBM(nn.Module):
         """
         Forward pass with optional refinement.
         
+        Properly computes energy using the energy head, not from logits.
+        
         Args:
             idx: Input tokens (B, T)
             targets: Target tokens for loss computation (B, T)
@@ -247,45 +244,73 @@ class EBM(nn.Module):
         """
         metrics = {}
         
+        # Get hidden states and energies (same for both S1 and S2)
+        h = self.get_hidden_states(idx)
+        energies = self.energy_head(h)  # (B, T, V)
+        
+        # System 1: Direct readout
+        logits_s1 = -energies
+        probs_s1 = F.softmax(logits_s1, dim=-1)
+        EE_s1 = (probs_s1 * energies).sum(dim=-1).mean()  # Expected energy S1
+        
         if use_refine:
-            # Get initial System 1 logits for energy tracking
-            with torch.no_grad():
-                initial_logits = self.system1_direct_energy(idx)
-                
-                # Compute initial expected energy
-                # Energy = -logits (since logits = -energy in our formulation)
-                # So expected energy = E_p[-logits] = -E_p[logits]
-                probs_initial = F.softmax(initial_logits, dim=-1)
-                expected_logits_initial = (probs_initial * initial_logits).sum(dim=-1).mean()
-                metrics['initial_energy'] = -expected_logits_initial.item()
+            # System 2: Refined prediction
+            logits_s2 = self.system2_refine(idx, steps=refine_steps)
+            probs_s2 = F.softmax(logits_s2, dim=-1)
+            EE_s2 = (probs_s2 * energies).sum(dim=-1).mean()  # Expected energy S2
+            logits = logits_s2
             
-            # Get refined logits through System 2
-            logits = self.system2_refine(idx, steps=refine_steps)
+            # Track energy metrics
+            metrics['EE_s1'] = EE_s1.item()
+            metrics['EE_s2'] = EE_s2.item()
+            metrics['delta_EE'] = (EE_s1 - EE_s2).item()  # Should be positive
             
-            # Compute final expected energy after refinement
-            with torch.no_grad():
-                probs_final = F.softmax(logits, dim=-1)
-                expected_logits_final = (probs_final * logits).sum(dim=-1).mean()
-                metrics['final_energy'] = -expected_logits_final.item()
-                
-                # Energy gap should be positive (initial - final) if System 2 improves
-                metrics['energy_gap'] = metrics['initial_energy'] - metrics['final_energy']
+            # For backward compatibility
+            metrics['initial_energy'] = EE_s1.item()
+            metrics['final_energy'] = EE_s2.item()
+            metrics['energy_gap'] = metrics['delta_EE']
         else:
-            # System 1: Direct prediction
-            logits = self.system1_direct_energy(idx)
+            logits = logits_s1
+            metrics['EE_s1'] = EE_s1.item()
+            metrics['EE_s2'] = EE_s1.item()
+            metrics['delta_EE'] = 0.0
         
         # Compute loss if targets provided
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size),
+            # Compute NLL for both S1 and S2
+            nll_s1 = F.cross_entropy(
+                logits_s1.view(-1, self.config.vocab_size),
                 targets.view(-1),
                 ignore_index=-1
             )
             
-            # Track perplexity
-            with torch.no_grad():
-                metrics['perplexity'] = torch.exp(loss).item()
+            if use_refine:
+                nll_s2 = F.cross_entropy(
+                    logits_s2.view(-1, self.config.vocab_size),
+                    targets.view(-1),
+                    ignore_index=-1
+                )
+                loss = nll_s2
+                
+                # Track NLL metrics
+                metrics.update({
+                    'nll_s1': nll_s1.item(),
+                    'nll_s2': nll_s2.item(),
+                    'ppl_s1': torch.exp(nll_s1).item(),
+                    'ppl_s2': torch.exp(nll_s2).item(),
+                    'delta_nll': (nll_s1 - nll_s2).item(),  # Should be positive
+                })
+                
+                # For backward compatibility
+                metrics['perplexity'] = metrics['ppl_s2']
+            else:
+                loss = nll_s1
+                metrics.update({
+                    'nll_s1': nll_s1.item(),
+                    'ppl_s1': torch.exp(nll_s1).item(),
+                    'perplexity': torch.exp(nll_s1).item(),
+                })
         
         return loss, logits, metrics
     
