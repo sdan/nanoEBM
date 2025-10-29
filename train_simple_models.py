@@ -1,5 +1,13 @@
 """
-Train simple GPT vs EBM models for clear comparison
+Train simple GPT vs EBM models for clear comparison.
+
+CLI usage examples:
+  - Train GPT for 5000 steps:
+      python train_simple_models.py --model gpt --max_steps 5000
+  - Train EBM for 5000 steps:
+      python train_simple_models.py --model ebm --max_steps 5000
+  - Train both (defaults):
+      python train_simple_models.py --model both --max_steps 2000
 """
 
 import torch
@@ -11,6 +19,7 @@ from nanoebm.model import EBM
 from nanoebm.data import get_loader
 from nanoebm.config import Config, ModelConfig, DataConfig, TrainConfig
 import chz
+import argparse
 
 def create_small_config():
     """Create a smaller model config for faster training."""
@@ -312,22 +321,44 @@ def compare_trained_models():
     print("="*60)
 
 def main():
-    """Train both models and compare."""
+    parser = argparse.ArgumentParser(description="Train simple GPT vs EBM models")
+    parser.add_argument("--model", choices=["gpt", "ebm", "both"], default="both",
+                        help="Which model to train")
+    parser.add_argument("--max_steps", type=int, default=1000,
+                        help="Number of training steps")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Override device (cuda|mps|cpu)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override batch size")
+    parser.add_argument("--block_size", type=int, default=None,
+                        help="Override context length")
+    args = parser.parse_args()
 
     print("\n🎓 TRAINING SIMPLE MODELS FOR COMPARISON")
-    print("This will train small GPT and EBM models on Shakespeare")
-    print("to demonstrate the difference between them.\n")
+    print("This will train small GPT and/or EBM models on Shakespeare\n")
 
-    # Train GPT baseline
-    print("1. Training GPT baseline (no refinement)...")
-    gpt_model, gpt_cfg = train_model("gpt")
+    def cfg_with_overrides():
+        cfg = create_small_config()
+        cfg.train.max_steps = int(args.max_steps)
+        if args.device:
+            cfg.train.device = args.device
+        if args.batch_size:
+            cfg.data.batch_size = int(args.batch_size)
+        if args.block_size:
+            cfg.data.block_size = int(args.block_size)
+            cfg.model.block_size = int(args.block_size)
+        return cfg
 
-    # Train EBM with refinement
-    print("\n2. Training EBM (with refinement)...")
-    ebm_model, ebm_cfg = train_model("ebm")
+    if args.model in ("gpt", "both"):
+        print("1. Training GPT baseline (no refinement)...")
+        _gpt_model, _gpt_cfg = train_model("gpt", cfg_with_overrides())
 
-    # Compare results
-    compare_trained_models()
+    if args.model in ("ebm", "both"):
+        print("\n2. Training EBM (with refinement)...")
+        _ebm_model, _ebm_cfg = train_model("ebm", cfg_with_overrides())
+
+    if args.model == "both":
+        compare_trained_models()
 
 if __name__ == "__main__":
     main()
