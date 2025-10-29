@@ -99,9 +99,13 @@ def main(cfg: SampleConfig):
             "Ensure you are using the same data file used for training."
         )
 
-    # Encode prompt
+    # Encode prompt (filter unknown chars for robustness)
     print(f"\nPrompt: {cfg.prompt!r}")
-    idx = torch.tensor([[stoi[c] for c in cfg.prompt]], dtype=torch.long, device=device)
+    known = [c for c in cfg.prompt if c in stoi]
+    dropped = [c for c in cfg.prompt if c not in stoi]
+    if dropped:
+        print(f"[warn] Dropping {len(dropped)} unknown chars from prompt: {repr(''.join(dropped))}")
+    idx = torch.tensor([[stoi[c] for c in known]], dtype=torch.long, device=device)
 
     # Generate based on mode
     if cfg.mode == "fast":

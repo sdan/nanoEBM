@@ -95,6 +95,12 @@ def train_model(model_type="gpt", cfg=None):
         "val"
     )
 
+    # Ensure vocab_size matches dataset (avoid decoding mismatches later)
+    ds_vocab = len(train_ds.stoi)
+    if ds_vocab != cfg.model.vocab_size:
+        print(f"[warn] Overriding cfg.model.vocab_size {cfg.model.vocab_size} -> {ds_vocab} to match dataset")
+        cfg.model.vocab_size = ds_vocab
+
     # Initialize model
     model = EBM(cfg.model).to(device)
 
@@ -197,6 +203,11 @@ def train_model(model_type="gpt", cfg=None):
                         'model': cfg.model.__dict__,
                         'data': cfg.data.__dict__,
                         'train': cfg.train.__dict__
+                    },
+                    # Save minimal vocab mapping info for consistent decoding
+                    'meta': {
+                        'vocab_size': len(train_ds.stoi),
+                        'data_path': cfg.data.data_path
                     },
                     'val_loss': val_loss,
                     'model_type': model_type

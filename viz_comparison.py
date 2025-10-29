@@ -267,8 +267,16 @@ def create_comparison_animation(config):
                 transformer_model.load_state_dict(ebm_model.transformer.state_dict())
                 transformer_model.eval()
 
-            # Load dataset
-            dataset = CharDataset("shakespeare.txt", block_size=model_cfg.block_size, split="train")
+            # Load dataset (prefer checkpoint data path if available)
+            data_path = None
+            try:
+                data_path = ckpt.get("config", {}).get("data", {}).get("data_path", None)
+            except Exception:
+                data_path = None
+            data_path = data_path or "shakespeare.txt"
+            dataset = CharDataset(data_path, block_size=model_cfg.block_size, split="train")
+            if len(dataset.stoi) != model_cfg.vocab_size:
+                print(f"[warn] dataset vocab ({len(dataset.stoi)}) != model vocab ({model_cfg.vocab_size}); decoding may differ")
 
             # Encode prompt
             stoi = dataset.stoi
