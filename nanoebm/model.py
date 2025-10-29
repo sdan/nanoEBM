@@ -48,6 +48,12 @@ class EnergyHead(nn.Module):
         d_energy = getattr(ebt_cfg, "d_energy", d_model)
         self.context_proj = nn.Linear(d_model, d_energy, bias=True)
         self.token_proj = nn.Linear(d_model, d_energy, bias=False)
+        # Mixture-aware pathway: combines context h with mixture embedding y_mix
+        self.mixture_mlp = nn.Sequential(
+            nn.Linear(d_model + d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_energy),
+        )
         self.use_token_bias = getattr(ebt_cfg, "use_token_bias", True)
         if self.use_token_bias:
             self.token_bias = nn.Parameter(torch.zeros(gpt_cfg.vocab_size))
@@ -82,6 +88,35 @@ class EnergyHead(nn.Module):
             E = E + self.token_bias.view(1, 1, -1)
         return E
 
+    def energies_with_mixture(
+        self,
+        h: torch.Tensor,
+        wte_weight: torch.Tensor,
+        p_dist: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mixture-aware energies conditioned on current distribution p.
+
+        h: (B,T,d_model)
+        wte_weight: (V,d_model)
+        p_dist: (B,T,V)
+        Returns: (B,T,V) energies
+        """
+        # Mixture embedding of tokens under current distribution
+        y_mix = torch.einsum("btv,vd->btd", p_dist, wte_weight)  # (B,T,d_model)
+        context_mix = torch.cat([h, y_mix], dim=-1)  # (B,T,2*d_model)
+        r = self.mixture_mlp(context_mix)  # (B,T,d_energy)
+
+        # Base energy term
+        C = self.context_proj(h)  # (B,T,dE)
+        R = self.token_features(wte_weight)  # (V,dE)
+        E_base = -torch.einsum("btd,vd->btv", C, R)
+        # Mixture-aware correction
+        E_corr = -torch.einsum("btd,vd->btv", r, R)
+        E = E_base + E_corr
+        if self.use_token_bias:
+            E = E + self.token_bias.view(1, 1, -1)
+        return E
+
 
 class EBTLanguageModel(nn.Module):
     """
@@ -91,12 +126,15 @@ class EBTLanguageModel(nn.Module):
     def __init__(self, gpt_cfg: ModelConfig, ebt_cfg: ModelConfig):
         super().__init__()
         self.backbone = ContextTransformer(gpt_cfg)
-        self.energy = EnergyHead(gpt_cfg, ebt_cfg)
+        # Mode selection: lm_head-as-energy or factorized EnergyHead
+        self.use_lm_energy = bool(getattr(ebt_cfg, "use_lm_head_as_energy", False))
+        self.energy_temperature = float(getattr(ebt_cfg, "energy_temperature", 1.0) or 1.0)
+        self.energy = None if self.use_lm_energy else EnergyHead(gpt_cfg, ebt_cfg)
         self.gpt_cfg = gpt_cfg
         self.ebt_cfg = ebt_cfg
         # Learnable step size alpha (per-model scalar)
-        alpha_init = float(getattr(ebt_cfg, "mcmc_step_size", 1.0))
-        learn_alpha = bool(getattr(ebt_cfg, "mcmc_step_size_learnable", False))
+        alpha_init = float(getattr(ebt_cfg, "refine_step_size", 1.0))
+        learn_alpha = bool(getattr(ebt_cfg, "refine_step_size_learnable", False))
         self.alpha = nn.Parameter(torch.tensor(alpha_init), requires_grad=learn_alpha)
 
     @property
@@ -113,7 +151,11 @@ class EBTLanguageModel(nn.Module):
         x = idx[:, :-1]
         y = idx[:, 1:]
         h = self.backbone(x)  # (B, T-1, d_model)
-        E = self.energy.energies_all_tokens(h, self.wte_weight)  # (B, T-1, V)
+        if self.use_lm_energy:
+            logits_raw = self.backbone.core.lm_head(h)  # (B,T-1,V)
+            E = -(logits_raw / max(1e-6, self.energy_temperature))
+        else:
+            E = self.energy.energies_all_tokens(h, self.wte_weight)  # (B, T-1, V)
 
         # Baseline logits from energies and auxiliary CE to explicitly train the energy head
         logits_baseline = -E
@@ -125,9 +167,9 @@ class EBTLanguageModel(nn.Module):
                 ignore_index=-1,
             )
 
-        # If no MCMC steps requested, fall back to standard CE on -E
-        K = int(getattr(self.ebt_cfg, "mcmc_num_steps", 0))
-        if K <= 0:
+        # If no refinement steps requested, fall back to standard CE on -E
+        steps = int(getattr(self.ebt_cfg, "refine_steps", 0))
+        if steps <= 0:
             logits = logits_baseline
             loss = None
             if targets is not None:
@@ -147,10 +189,12 @@ class EBTLanguageModel(nn.Module):
         # Slice to last position if enabled
         if refine_last_only:
             E_work = E[:, -1:, :]
+            h_work = h[:, -1:, :]
             y_work = y[:, -1:]
             T_work = 1
         else:
             E_work = E
+            h_work = h
             y_work = y
             T_work = Tm1
         # Initialize v in model dtype, then cast to float32 for inner math
@@ -164,8 +208,9 @@ class EBTLanguageModel(nn.Module):
         loss_main = None
         tau_H = float(getattr(self.ebt_cfg, "entropy_reg_tau", 0.0) or 0.0)
         label_smooth_base = float(getattr(self.ebt_cfg, "soften_target_prob_dist", 0.0) or 0.0)
-        do_detach = not bool(getattr(self.ebt_cfg, "no_mcmc_detach", False))
-        truncate = bool(getattr(self.ebt_cfg, "truncate_mcmc", False))
+        # Detach policy and truncation (prefer new names, fallback to legacy)
+        do_detach = bool(getattr(self.ebt_cfg, "detach_refine", True))
+        truncate = bool(getattr(self.ebt_cfg, "truncate_refine", False))
         langevin_std = float(getattr(self.ebt_cfg, "langevin_noise", 0.0) or 0.0)
         clamp_change = float(getattr(self.ebt_cfg, "clamp_update_max_change", 0.0) or 0.0)
         abs_clamp = float(getattr(self.ebt_cfg, "absolute_clamp", 0.0) or 0.0)
@@ -186,9 +231,9 @@ class EBTLanguageModel(nn.Module):
             energy_trace.append(float(init_energy_mean.detach().cpu()))
 
         # Main loop
-        for k in range(K):
+        for k in range(steps):
             # Detach per-step by default; keep the final step connected when truncating (one-step-through)
-            if do_detach and (not truncate or k < K - 1):
+            if do_detach and (not truncate or k < steps - 1):
                 v32 = v32.detach()
             v32.requires_grad_(True)
 
@@ -198,7 +243,12 @@ class EBTLanguageModel(nn.Module):
 
             # Compute relaxed objective J = E_p[E] - tau * H(p)
             p = F.softmax(v32, dim=-1)
-            J = (p * E32).sum(dim=-1).sum()
+            # Mixture-aware energy update if using EnergyHead; otherwise keep static E32
+            if self.energy is not None:
+                E32_used = self.energy.energies_with_mixture(h_work, self.wte_weight, p).float()
+            else:
+                E32_used = E32
+            J = (p * E32_used).sum(dim=-1).sum()
             if tau_H != 0.0:
                 p_safe = p.clamp_min(1e-9)
                 H = -(p_safe * p_safe.log()).sum(dim=-1).sum()
@@ -226,15 +276,15 @@ class EBTLanguageModel(nn.Module):
 
             # Per-step loss vs ground truth
             if targets is not None:
-                if label_smooth_base != 0.0 and K > 1:
-                    ls = ((K - 1 - k) / (K - 1)) * label_smooth_base
+                if label_smooth_base != 0.0 and steps > 1:
+                    ls = ((steps - 1 - k) / (steps - 1)) * label_smooth_base
                 else:
                     ls = 0.0
                 ce = F.cross_entropy(
                     v32.reshape(-1, V), y_work.reshape(-1), ignore_index=-1, label_smoothing=ls if ls > 0 else 0.0
                 )
                 if truncate:
-                    if k == K - 1:
+                    if k == steps - 1:
                         loss_main = ce
                 else:
                     step_losses.append(ce)
@@ -292,13 +342,31 @@ class EBTLanguageModel(nn.Module):
 
         return loss, logits, extras
 
+    def energies(self, idx: torch.Tensor) -> torch.Tensor:
+        """Compute energies E for all positions given input tokens.
+
+        idx: (B, T) int tokens
+        Returns: (B, T, V) energies for next-token at each position
+        """
+        h = self.backbone(idx)  # (B, T, d_model)
+        if self.use_lm_energy:
+            logits = self.backbone.core.lm_head(h)
+            return -(logits / max(1e-6, self.energy_temperature))
+        else:
+            return self.energy.energies_all_tokens(h, self.wte_weight)
+
     @torch.no_grad()
     def generate_greedy(self, idx: torch.Tensor, max_new_tokens: int = 100) -> torch.Tensor:
-        self.energy.cached_token_features = None
+        if self.energy is not None:
+            self.energy.cached_token_features = None
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.gpt_cfg.block_size :]
             h = self.backbone(idx_cond)[:, -1]  # (B, d)
-            E = self.energy.energies_all_tokens(h.unsqueeze(1), self.wte_weight)[:, 0, :]
+            if self.use_lm_energy:
+                logits = self.backbone.core.lm_head(h)
+                E = -(logits / max(1e-6, self.energy_temperature))
+            else:
+                E = self.energy.energies_all_tokens(h.unsqueeze(1), self.wte_weight)[:, 0, :]
             nxt = torch.argmin(E, dim=-1, keepdim=True)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
@@ -309,7 +377,8 @@ class EBTLanguageModel(nn.Module):
         max_new_tokens: int = 100,
         steps: Optional[int] = None,
         lr: Optional[float] = None,
-        tau: Optional[float] = None,
+        temp: Optional[float] = None,
+        entropy: Optional[float] = None,
         noise: Optional[float] = None,
         topk: Optional[int] = None,
         # Decoding options
@@ -319,11 +388,14 @@ class EBTLanguageModel(nn.Module):
     ) -> torch.Tensor:
         # Default to config/model params if not provided
         if steps is None:
-            steps = int(getattr(self.ebt_cfg, "mcmc_num_steps", 0) or 0)
+            steps = int(getattr(self.ebt_cfg, "refine_steps", 0) or 0)
         if lr is None:
             lr = float(self.alpha.detach().clamp(min=1e-6).item())
-        if tau is None:
-            tau = float(getattr(self.ebt_cfg, "entropy_reg_tau", 1.0) or 1.0)
+        # Temperature (softmax) and entropy weight defaults
+        if temp is None:
+            temp = 1.0
+        if entropy is None:
+            entropy = float(getattr(self.ebt_cfg, "entropy_reg_tau", 0.0) or 0.0)
         if noise is None:
             noise = float(getattr(self.ebt_cfg, "langevin_noise", 0.0) or 0.0)
         clamp_change = float(getattr(self.ebt_cfg, "clamp_update_max_change", 0.0) or 0.0)
@@ -356,49 +428,83 @@ class EBTLanguageModel(nn.Module):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.gpt_cfg.block_size :]
             h_last = self.backbone(idx_cond)[:, -1]  # (B, d)
-            E = self.energy.energies_all_tokens(h_last.unsqueeze(1), self.wte_weight)[:, 0, :]  # (B,V)
-            if topk is not None:
-                topE, topI = torch.topk(-E, k=topk, dim=-1)  # (B,K)
-                v = topE.clone()
-                cand_idx = topI  # (B,K)
-            else:
-                v = (-E).clone()
-                cand_idx = None
-
-            v = v.detach().requires_grad_(True)
-            for _k in range(steps):
-                p = F.softmax(v / tau, dim=-1)  # (B,K) or (B,V)
-                R = self.energy.token_features(self.wte_weight)  # (V,dE)
-                if cand_idx is not None:
-                    R_sel = R[cand_idx]  # (B,K,dE)
+            if self.use_lm_energy:
+                # Simple path: E = -(logits/T), refine logits directly by minimizing Ebar - entropy*H
+                logits0 = self.backbone.core.lm_head(h_last)  # (B,V)
+                E_full = -(logits0 / max(1e-6, self.energy_temperature))
+                if topk is not None:
+                    v, cand_idx = torch.topk(logits0, k=topk, dim=-1)  # start from top-k logits
+                    E_sel = torch.gather(E_full, dim=-1, index=cand_idx)
                 else:
-                    R_sel = R.unsqueeze(0).expand(p.size(0), -1, -1)  # (B,V,dE)
-                c = self.energy.context_proj(h_last)  # (B,dE)
-                e = torch.einsum("bk,bkd->bd", p, R_sel)  # (B,dE)
-                if self.energy.use_token_bias:
-                    if cand_idx is not None:
-                        b_sel = self.energy.token_bias[cand_idx]  # (B,K)
-                        b = torch.einsum("bk,bk->b", p, b_sel)
+                    v = logits0.clone()
+                    cand_idx = None
+                    E_sel = E_full
+
+                v = v.detach().requires_grad_(True)
+                for _k in range(steps):
+                    p = F.softmax(v / max(1e-6, float(temp)), dim=-1)
+                    Ebar = (p * E_sel).sum(dim=-1).mean()
+                    if float(entropy) != 0.0:
+                        p_safe = p.clamp_min(1e-9)
+                        H = -(p_safe * p_safe.log()).sum(dim=-1).mean()
+                        J = Ebar - float(entropy) * H
                     else:
-                        b = torch.einsum("bk,k->b", p, self.energy.token_bias)
+                        J = Ebar
+                    (g,) = torch.autograd.grad(J, v, retain_graph=False, create_graph=False)
+                    delta = -lr * g
+                    if clamp_change and clamp_change > 0.0:
+                        delta = delta.clamp(min=-clamp_change, max=clamp_change)
+                    v = (v + delta).detach()
+                    if abs_clamp and abs_clamp > 0.0:
+                        v = v.clamp(min=-abs_clamp, max=abs_clamp)
+                    if noise and noise > 0:
+                        v = v + noise * torch.randn_like(v)
+                    v.requires_grad_(True)
+            else:
+                # Original factorized EnergyHead refinement
+                E = self.energy.energies_all_tokens(h_last.unsqueeze(1), self.wte_weight)[:, 0, :]  # (B,V)
+                if topk is not None:
+                    topE, topI = torch.topk(-E, k=topk, dim=-1)  # (B,K)
+                    v = topE.clone()
+                    cand_idx = topI  # (B,K)
                 else:
-                    b = torch.zeros(p.size(0), device=v.device)
+                    v = (-E).clone()
+                    cand_idx = None
 
-                E_relaxed = b - (c * e).sum(-1)  # (B,)
-                H = -(p.clamp_min(1e-9) * (p.clamp_min(1e-9)).log()).sum(-1)  # (B,)
-                J = E_relaxed - tau * H
-                (g,) = torch.autograd.grad(J.sum(), v, retain_graph=False, create_graph=False)
-                # Apply delta clamp for stability
-                delta = -lr * g
-                if clamp_change and clamp_change > 0.0:
-                    delta = delta.clamp(min=-clamp_change, max=clamp_change)
-                v = (v + delta).detach()
-                # Optional absolute clamp
-                if abs_clamp and abs_clamp > 0.0:
-                    v = v.clamp(min=-abs_clamp, max=abs_clamp)
-                if noise and noise > 0:
-                    v = v + noise * torch.randn_like(v)
-                v.requires_grad_(True)
+                v = v.detach().requires_grad_(True)
+                for _k in range(steps):
+                    p = F.softmax(v / max(1e-6, float(temp)), dim=-1)  # (B,K) or (B,V)
+                    R = self.energy.token_features(self.wte_weight)  # (V,dE)
+                    if cand_idx is not None:
+                        R_sel = R[cand_idx]  # (B,K,dE)
+                    else:
+                        R_sel = R.unsqueeze(0).expand(p.size(0), -1, -1)  # (B,V,dE)
+                    c = self.energy.context_proj(h_last)  # (B,dE)
+                    e = torch.einsum("bk,bkd->bd", p, R_sel)  # (B,dE)
+                    if self.energy.use_token_bias:
+                        if cand_idx is not None:
+                            b_sel = self.energy.token_bias[cand_idx]  # (B,K)
+                            b = torch.einsum("bk,bk->b", p, b_sel)
+                        else:
+                            b = torch.einsum("bk,k->b", p, self.energy.token_bias)
+                    else:
+                        b = torch.zeros(p.size(0), device=v.device)
+
+                    E_relaxed = b - (c * e).sum(-1)  # (B,)
+                    H = -(p.clamp_min(1e-9) * (p.clamp_min(1e-9)).log()).sum(-1)  # (B,)
+                    J = E_relaxed - float(entropy) * H
+                    (g,) = torch.autograd.grad(J.sum(), v, retain_graph=False, create_graph=False)
+                    # Apply delta clamp for stability
+                    delta = -lr * g
+                    if clamp_change and clamp_change > 0.0:
+                        delta = delta.clamp(min=-clamp_change, max=clamp_change)
+                    v = (v + delta).detach()
+                    # Optional absolute clamp
+                    if abs_clamp and abs_clamp > 0.0:
+                        v = v.clamp(min=-abs_clamp, max=abs_clamp)
+                    if noise and noise > 0:
+                        v = v + noise * torch.randn_like(v)
+                    v.requires_grad_(True)
 
             if sample:
                 # Sample from refined distribution with optional temperature and top-p

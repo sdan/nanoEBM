@@ -6,8 +6,8 @@ Usage:
     python train.py train.learning_rate=1e-3 train.max_steps=5000
     python train.py model.n_layer=12 data.batch_size=128
     python train.py wandb_project=nanoebm
-    # train with step size learning
-    python train.py model.mcmc_num_steps=2 model.truncate_mcmc=True model.no_mcmc_detach=False model.mcmc_step_size_learnable=True
+    # train with step size learning (refinement)
+    python train.py model.refine_steps=2 model.truncate_refine=True model.detach_refine=True model.refine_step_size_learnable=True
 """
 
 import os
@@ -74,9 +74,9 @@ def main(cfg: Config):
     if cfg.train.compile:
         model = torch.compile(model)
 
-    # Initialize the optimizer with separate learning rates for alpha (MCMC step size)
+    # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
-    alpha_lr_multiplier = getattr(model_cfg, 'mcmc_step_size_lr_multiplier', 3.0)
+    alpha_lr_multiplier = getattr(model_cfg, 'refine_step_size_lr_multiplier', 3.0)
     
     # Separate parameters into alpha and non-alpha groups
     alpha_params = []

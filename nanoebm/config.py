@@ -7,7 +7,7 @@ import chz
 @chz.chz
 class ModelConfig:
     """Core model architecture configuration"""
-    vocab_size: int = 50304  # GPT-2 vocab size (rounded to nearest multiple of 64)
+    vocab_size: int = 256
     block_size: int = 256
     n_layer: int = 6
     n_head: int = 6
@@ -15,19 +15,24 @@ class ModelConfig:
     dropout: float = 0.1
     bias: bool = True
 
-    # Energy-based thinking parameters
+    # EBM thinking parameters
+    # Use simple lm_head-as-energy (E = -logits / T) instead of EnergyHead
+    use_lm_head_as_energy: bool = True
+    energy_temperature: float = 1.0
     energy_hidden: int = 4
     use_shared_embeddings: bool = True
-    mcmc_num_steps: int = 0
-    mcmc_step_size: float = 1.0
-    mcmc_step_size_learnable: bool = False
-    langevin_noise: float = 0.0
+
+    # Iterative refinement (NOT MCMC): gradient descent on logits to minimize expected energy.
+    # Iterative refinement config
+    refine_steps: int = 0  # Number of refinement steps (0 = no refinement)
+    refine_step_size: float = 1.0  # Step size (learning rate) for refinement updates
+    refine_step_size_learnable: bool = False  # Make step size a learnable parameter
+    langevin_noise: float = 0.0  # Optional noise for Langevin dynamics (usually 0)
     # Step size optimizer behavior
-    mcmc_step_size_lr_multiplier: float = 3.0
-    # MCMC loop stability/behavior toggles
-    no_mcmc_detach: bool = False
-    truncate_mcmc: bool = False
-    normalize_initial_condition: bool = True
+    refine_step_size_lr_multiplier: float = 3.0
+    # Refinement loop stability/behavior toggles (still not MCMC!)
+    detach_refine: bool = True  # Detach per-step by default for stability
+    truncate_refine: bool = False  # Backprop only through final step
     denoising_initial_condition: str = "random_noise"  # random_noise | zeros
     refine_last_position_only: bool = True  # train-time simplification (Phase 1)
     clamp_update_max_change: float = 0.25  # per-step delta clamp in logit space (0 disables)
@@ -38,11 +43,7 @@ class ModelConfig:
     aux_ce_weight: float = 0.5
     # Optional logging of expected energy trace across steps (mean over active positions)
     log_expected_energy_trace: bool = False
-    # Optional randomized steps (off by default)
-    randomize_mcmc_num_steps: int = 0
-    randomize_mcmc_num_steps_min: int = 0
-    randomize_mcmc_num_steps_final_landscape: bool = False
-    randomize_mcmc_step_size_scale: float = 1.0
+    # Removed unused randomization options to simplify config
 
 
 @chz.chz

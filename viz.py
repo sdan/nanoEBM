@@ -794,9 +794,9 @@ def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     # Build a small test loader
     loader, _ = get_loader(cfg.data_path, model.gpt_cfg.block_size, batch_size=cfg.batch_size, split="test")
     # Greedy (no thinking): set K=0
-    K_save = int(getattr(model.ebt_cfg, "mcmc_num_steps", 0) or 0)
+    K_save = int(getattr(model.ebt_cfg, "refine_steps", 0) or 0)
     refine_last_save = bool(getattr(model.ebt_cfg, "refine_last_position_only", True))
-    setattr(model.ebt_cfg, "mcmc_num_steps", 0)
+    setattr(model.ebt_cfg, "refine_steps", 0)
     setattr(model.ebt_cfg, "refine_last_position_only", False)
     losses_g = []
     acc_energy_argmin = []
@@ -817,7 +817,7 @@ def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     acc_energy = float(torch.tensor(acc_energy_argmin).mean().item())
 
     # Thinking K steps: set K and refine last position only for speed
-    setattr(model.ebt_cfg, "mcmc_num_steps", max(1, int(cfg.steps)))
+    setattr(model.ebt_cfg, "refine_steps", max(1, int(cfg.steps)))
     setattr(model.ebt_cfg, "refine_last_position_only", True)
     setattr(model.ebt_cfg, "entropy_reg_tau", float(cfg.tau))
     losses_t = []
@@ -831,7 +831,7 @@ def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     ppl_t = float(torch.exp(torch.tensor(losses_t).mean()).item())
 
     # restore
-    setattr(model.ebt_cfg, "mcmc_num_steps", K_save)
+    setattr(model.ebt_cfg, "refine_steps", K_save)
     setattr(model.ebt_cfg, "refine_last_position_only", refine_last_save)
 
     text = (

@@ -265,10 +265,10 @@ def estimate_energy_head_forward_flops(batch: int, time: int, vocab: int, d_mode
     return flops
 
 
-def estimate_step_flops(batch: int, seq_len: int, vocab: int, n_layer: int, n_head: int, d_model: int, d_energy: int | None, K: int, refine_last_only: bool, training: bool = True) -> dict:
+def estimate_step_flops(batch: int, seq_len: int, vocab: int, n_layer: int, n_head: int, d_model: int, d_energy: int | None, refine_steps: int, refine_last_only: bool, training: bool = True) -> dict:
     """Ballpark FLOPs per training step.
-    Returns a dict with forward_gflops and train_gflops (heuristic: ~3x forward).
-    Also includes an estimate for the inner-loop refinement cost proportional to B*T_work*V*K.
+    Returns forward_gflops and train_gflops (heuristic: ~3x forward),
+    including an approximate inner-loop refinement cost ~ B*T_work*V*refine_steps.
     """
     # Backbone forward across T-1 positions
     f_gpt = estimate_transformer_forward_flops(batch, seq_len - 1, n_layer, n_head, d_model)
@@ -278,7 +278,7 @@ def estimate_step_flops(batch: int, seq_len: int, vocab: int, n_layer: int, n_he
 
     # Inner loop cost (very approximate): softmax + expectation + simple grads w.r.t logits
     T_work = 1 if (training and refine_last_only) else (seq_len - 1)
-    inner = 6 * batch * T_work * vocab * max(0, K)  # scaled constant captures softmax+grad cost
+    inner = 6 * batch * T_work * vocab * max(0, refine_steps)  # scaled constant captures softmax+grad cost
     forward += inner
 
     # Heuristic: training backward is ~2x forward for matmul-dominant nets
