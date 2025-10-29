@@ -146,12 +146,20 @@ def visualize_correlation(model: EBTLanguageModel, ds: CharDataset, cfg: VizConf
         with torch.no_grad():
             h = model.backbone(x)
             E = model.energy.energies_all_tokens(h, model.wte_weight)  # (B,T,V)
+            # Align shapes: logits may have different seq length than y
+            T_logits = logits.size(1)
+            T_y = y.size(1)
+            # Trim to match minimum length
+            T_min = min(T_logits, T_y)
+            logits_aligned = logits[:, :T_min, :]
+            y_aligned = y[:, :T_min]
+            E_aligned = E[:, :T_min, :]
             # gather energies at true token indices
-            Et = E.gather(-1, y.unsqueeze(-1)).squeeze(-1)  # (B,T)
+            Et = E_aligned.gather(-1, y_aligned.unsqueeze(-1)).squeeze(-1)  # (B,T_min)
             energies_true.append(Et.flatten().cpu())
             # per-position CE from logits
             ce = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="none"
+                logits_aligned.reshape(-1, logits_aligned.size(-1)), y_aligned.reshape(-1), reduction="none"
             ).reshape_as(Et)
             ce_losses.append(ce.flatten().cpu())
 
@@ -748,23 +756,24 @@ def animate_energy_curve(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfi
 
     plt.close(fig)
 
-@torch.no_grad()
 def energy_margin_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     device = next(model.parameters()).device
     loader, _ = get_loader(cfg.data_path, model.gpt_cfg.block_size, batch_size=cfg.batch_size, split="test")
     x, y = next(iter(loader))
     x, y = x.to(device), y.to(device)
-    h = model.backbone(x)
-    E = model.energy.energies_all_tokens(h, model.wte_weight)  # (B,T,V)
-    # Focus last position for thinking analysis
-    E_last = E[:, -1, :]  # (B,V)
-    true_last = y[:, -1]
-    # baseline predicted token from v0 = -E
-    v0 = -E_last
-    pred0 = v0.argmax(-1)
-    # refined prediction after K steps on last position
+    with torch.no_grad():
+        h = model.backbone(x)
+        E = model.energy.energies_all_tokens(h, model.wte_weight)  # (B,T,V)
+        # Focus last position for thinking analysis
+        E_last = E[:, -1, :]  # (B,V)
+        true_last = y[:, -1]
+        # baseline predicted token from v0 = -E
+        v0 = -E_last
+        pred0 = v0.argmax(-1)
+    # refined prediction after K steps on last position (needs gradients)
     idx_cond = x[:, -model.gpt_cfg.block_size :]
-    idx_gen = model.generate_think(idx_cond, max_new_tokens=1, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think)
+    with torch.enable_grad():
+        idx_gen = model.generate_think(idx_cond, max_new_tokens=1, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think)
     predK = idx_gen[:, -1]
     # margins
     Et_true = E_last.gather(-1, true_last.unsqueeze(-1)).squeeze(-1)
@@ -788,26 +797,30 @@ def energy_margin_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfi
     print(f"Saved: {cfg.out_margin}")
 
 
-@torch.no_grad()
 def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     device = next(model.parameters()).device
     # Build a small test loader
     loader, _ = get_loader(cfg.data_path, model.gpt_cfg.block_size, batch_size=cfg.batch_size, split="test")
-    # Greedy (no thinking): set K=0
+
+    # Save original values (bypass frozen constraint with object.__setattr__)
     K_save = int(getattr(model.ebt_cfg, "mcmc_num_steps", 0) or 0)
     refine_last_save = bool(getattr(model.ebt_cfg, "refine_last_position_only", True))
-    setattr(model.ebt_cfg, "mcmc_num_steps", 0)
-    setattr(model.ebt_cfg, "refine_last_position_only", False)
+    tau_save = float(getattr(model.ebt_cfg, "entropy_reg_tau", 1.0))
+
+    # Greedy (no thinking): set K=0
+    object.__setattr__(model.ebt_cfg, "mcmc_num_steps", 0)
+    object.__setattr__(model.ebt_cfg, "refine_last_position_only", False)
+
     losses_g = []
     acc_energy_argmin = []
-    for i, (x, y) in enumerate(loader):
-        if i >= 5:
-            break
-        x, y = x.to(device), y.to(device)
-        loss, logits, _ = model(x, targets=y)
-        losses_g.append(loss.item())
-        # accuracy@1 of energy argmin (no loop)
-        with torch.no_grad():
+    with torch.no_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= 5:
+                break
+            x, y = x.to(device), y.to(device)
+            loss, logits, _ = model(x, targets=y)
+            losses_g.append(loss.item())
+            # accuracy@1 of energy argmin (no loop)
             h = model.backbone(x)
             E = model.energy.energies_all_tokens(h, model.wte_weight)
             pred = (-E).argmax(-1)  # argmin E over vocab
@@ -816,23 +829,26 @@ def eval_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     ppl_g = float(torch.exp(torch.tensor(losses_g).mean()).item())
     acc_energy = float(torch.tensor(acc_energy_argmin).mean().item())
 
-    # Thinking K steps: set K and refine last position only for speed
-    setattr(model.ebt_cfg, "mcmc_num_steps", max(1, int(cfg.steps)))
-    setattr(model.ebt_cfg, "refine_last_position_only", True)
-    setattr(model.ebt_cfg, "entropy_reg_tau", float(cfg.tau))
+    # Thinking K steps: set K>0 (needs gradients)
+    object.__setattr__(model.ebt_cfg, "mcmc_num_steps", max(1, int(cfg.steps)))
+    object.__setattr__(model.ebt_cfg, "refine_last_position_only", True)
+    object.__setattr__(model.ebt_cfg, "entropy_reg_tau", float(cfg.tau))
+
     losses_t = []
-    for i, (x, y) in enumerate(loader):
-        if i >= 5:
-            break
-        x, y = x.to(device), y.to(device)
-        loss, logits, extras = model(x, targets=y)
-        # extras["perplexity"] reflects refined main loss
-        losses_t.append(loss.item())
+    with torch.enable_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= 5:
+                break
+            x, y = x.to(device), y.to(device)
+            loss, logits, extras = model(x, targets=y)
+            # extras["perplexity"] reflects refined main loss
+            losses_t.append(loss.item())
     ppl_t = float(torch.exp(torch.tensor(losses_t).mean()).item())
 
-    # restore
-    setattr(model.ebt_cfg, "mcmc_num_steps", K_save)
-    setattr(model.ebt_cfg, "refine_last_position_only", refine_last_save)
+    # Restore original values
+    object.__setattr__(model.ebt_cfg, "mcmc_num_steps", K_save)
+    object.__setattr__(model.ebt_cfg, "refine_last_position_only", refine_last_save)
+    object.__setattr__(model.ebt_cfg, "entropy_reg_tau", tau_save)
 
     text = (
         f"Eval report (small test sample)\n"

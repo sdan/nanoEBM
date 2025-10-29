@@ -48,11 +48,14 @@ class ModelConfig:
 @chz.chz
 class DataConfig:
     """Dataset configuration"""
-    dataset: str = "shakespeare"  # shakespeare, wikitext
-    data_path: str = "shakespeare.txt"
+    dataset: str = "shakespeare"  # shakespeare, openfineweb
+    data_path: str = "shakespeare.txt"  # path to .txt or directory with .parquet shards
+    tokenizer: str = "char"  # 'char' or 'gpt2'
+    bpe_encoding: str = "gpt2"  # tiktoken encoding name if tokenizer!='char'
     block_size: int = 256
     batch_size: int = 64
     num_workers: int = 0
+    max_shards: int | None = None  # limit number of parquet shards for fast iteration
 
 
 @chz.chz

@@ -48,7 +48,7 @@ def think(
 ) -> ThinkingState:
     """Iterative refinement of next-token logits using energy expectations.
 
-    This is a minimal, generic version that requires `energy_fn(h_last) -> [B,V]`.
+    energy_fn(h_last) -> [B,V]
     """
     B, _ = h_last.shape
     V = wte.shape[0]
