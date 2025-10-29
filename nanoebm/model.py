@@ -7,37 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from collections import deque
 import random
 
 from .transformer import Transformer
 from .config import ModelConfig
-
-
-class ReplayBuffer:
-    """Simple replay buffer for storing and sampling previous predictions."""
-    
-    def __init__(self, max_size: int = 1000):
-        self.buffer = deque(maxlen=max_size)
-        self.max_size = max_size
-    
-    def add(self, logits: torch.Tensor):
-        """Store logits for future use."""
-        # Store as CPU tensor to save GPU memory
-        self.buffer.append(logits.detach().cpu())
-    
-    def sample(self, batch_size: int = 1) -> Optional[torch.Tensor]:
-        """Sample random previous predictions."""
-        if len(self.buffer) < batch_size:
-            return None
-        
-        samples = random.sample(self.buffer, batch_size)
-        # Stack and move back to original device
-        return torch.stack(samples)
-    
-    def has_samples(self) -> bool:
-        """Check if buffer has any samples."""
-        return len(self.buffer) > 0
 
 
 class EBM(nn.Module):
@@ -65,9 +38,6 @@ class EBM(nn.Module):
         
         # Fixed step size for gradient descent (not learned, following EBT)
         self.register_buffer('alpha', torch.tensor(config.alpha_value))
-        
-        # Store previous predictions to warm-start gradient descent
-        self.replay_buffer = ReplayBuffer(max_size=1000)
         
         # Initialize weights (energy head gets special initialization)
         self.apply(self._init_weights)
@@ -146,18 +116,8 @@ class EBM(nn.Module):
             else:
                 steps = self.config.refine_steps
         
-        # Initialize logits - use replay buffer if available
-        if self.config.use_replay_buffer and self.replay_buffer.has_samples() and self.training:
-            # Warm-start from replay buffer
-            sample = self.replay_buffer.sample(1).to(device)
-            if sample.shape[1] == T and sample.shape[2] == V:
-                # Expand the single sample to match current batch size
-                logits = sample[0].unsqueeze(0).expand(B, T, V).clone()
-            else:
-                logits = -energies.clone()  # Fallback to S1 if shape mismatch
-        else:
-            logits = -energies.clone()  # S1 initialization
-        
+        # Initialize logits from System 1 (simple and stable)
+        logits = -energies.clone()  # S1 initialization
         logits = logits.requires_grad_(True)
         
         trajectory = [logits.clone()] if return_trajectory else []
@@ -222,10 +182,6 @@ class EBM(nn.Module):
                 else:
                     early_stop_patience = 0
             prev_energy = current_energy
-        
-        # Store refined logits in replay buffer for future warm-starts
-        if self.config.use_replay_buffer and self.training and T == self.config.block_size:
-            self.replay_buffer.add(logits[0].detach())
         
         if return_trajectory:
             return logits, trajectory

@@ -20,7 +20,6 @@ class ModelConfig:
     refine_steps: int = 4                    # Number of refinement steps during inference
     alpha_value: float = 0.02                # Small step size for stable gradient descent
     langevin_noise: float = 0.005           # Small Langevin noise for exploration
-    use_replay_buffer: bool = True          # Use replay buffer for warm-start
     energy_convergence_threshold: float = 1e-4  # Threshold for early stopping based on energy
     warmup_steps_no_refine: int = 50        # Short warmup with S1 only
 
