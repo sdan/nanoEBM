@@ -350,14 +350,21 @@ def main():
 
     def cfg_with_overrides():
         cfg = create_small_config()
-        cfg.train.max_steps = int(args.max_steps)
+        t = cfg.train
+        d = cfg.data
+        m = cfg.model
+        # chz configs are frozen; use chz.replace to override
+        if args.max_steps is not None:
+            t = chz.replace(t, max_steps=int(args.max_steps))
         if args.device:
-            cfg.train.device = args.device
+            t = chz.replace(t, device=args.device)
         if args.batch_size:
-            cfg.data.batch_size = int(args.batch_size)
+            d = chz.replace(d, batch_size=int(args.batch_size))
         if args.block_size:
-            cfg.data.block_size = int(args.block_size)
-            cfg.model.block_size = int(args.block_size)
+            bs = int(args.block_size)
+            d = chz.replace(d, block_size=bs)
+            m = chz.replace(m, block_size=bs)
+        cfg = chz.replace(cfg, train=t, data=d, model=m)
         return cfg
 
     if args.model in ("gpt", "both"):
