@@ -18,9 +18,10 @@ class ModelConfig:
 
     # EBM refinement parameters (following EBT paper)
     refine_steps: int = 4                    # Number of refinement steps during inference
-    alpha_value: float = 0.1                 # Fixed step size for gradient descent (not learned)
-    langevin_noise: float = 0.01            # Langevin noise scale during training
+    alpha_value: float = 0.01                # Fixed step size for gradient descent (reduced for stability)
+    langevin_noise: float = 0.001           # Langevin noise scale during training (reduced)
     energy_convergence_threshold: float = 1e-4  # Threshold for early stopping based on energy
+    warmup_steps_no_refine: int = 100       # Train without System 2 for this many steps
 
 
 @chz.chz

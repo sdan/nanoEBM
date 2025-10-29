@@ -201,9 +201,12 @@ def timed(name: str, metrics: Dict[str, Any]):
 
 def get_lr(step: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float, min_lr: float) -> float:
     """Cosine learning rate schedule with warmup"""
-    # Linear warmup
+    # Linear warmup with minimum value to avoid lr=0 at step 0
     if step < warmup_iters:
-        return learning_rate * step / warmup_iters
+        # Start at 1% of target lr, linearly increase to full lr
+        warmup_min = learning_rate * 0.01
+        warmup_progress = step / warmup_iters
+        return warmup_min + (learning_rate - warmup_min) * warmup_progress
 
     # Cosine decay after warmup
     if step > lr_decay_iters:

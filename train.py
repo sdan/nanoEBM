@@ -74,33 +74,52 @@ def main(cfg: Config):
     if cfg.train.compile:
         model = torch.compile(model)
 
-    # Initialize the optimizer (alpha is now fixed, not learned)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.train.learning_rate,
-        betas=(cfg.train.beta1, cfg.train.beta2),
-        weight_decay=cfg.train.weight_decay
-    )
+    # Initialize the optimizer with separate learning rates for alpha (refine step size)
+    base_lr = cfg.train.learning_rate
+    alpha_lr_multiplier = getattr(model_cfg, 'alpha_lr_multiplier', 3.0)
 
-    # Resume from checkpoint if exists
+    # Separate parameters into alpha and non-alpha groups
+    alpha_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if name == 'alpha':
+            alpha_params.append(param)
+        else:
+            other_params.append(param)
+
+    # Build parameter groups with different learning rates
+    param_groups = []
+
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': base_lr,
+            'betas': (cfg.train.beta1, cfg.train.beta2),
+            'weight_decay': cfg.train.weight_decay,
+        })
+
+    if alpha_params:
+        param_groups.append({
+            'params': alpha_params,
+            'lr': base_lr * alpha_lr_multiplier,
+            'betas': (cfg.train.beta1, cfg.train.beta2),
+            'weight_decay': 0.0,  # No weight decay for alpha
+        })
+    optimizer = torch.optim.AdamW(param_groups)
+
+    # Resume from checkpoint (only if explicitly requested)
     start_step = 0
-    # if cfg.load_checkpoint:
-    #     ckpt_path = cfg.load_checkpoint
-    #     metadata = load_checkpoint(ckpt_path, model, optimizer)
-    #     start_step = metadata["step"]
-    #     logger.info(f"Resumed from {ckpt_path} at step {start_step}")
-    # else:
-    # Try to find the latest checkpoint recursively under base_out
-    from nanoebm.utils import get_latest_checkpoint
-    # Prefer latest in any previous run dir; if none, start fresh in this run_dir
-    latest_ckpt = get_latest_checkpoint(base_out)  # may return from nested run dirs
-    if latest_ckpt:
-        metadata = load_checkpoint(latest_ckpt, model, optimizer)
-        start_step = metadata["step"]
-        logger.info(f"Resumed from {latest_ckpt} at step {start_step}")
-        # Continue writing into the same directory as the checkpoint
-        run_dir = os.path.dirname(latest_ckpt)
-        logger.info(f"Continuing run in {run_dir}")
+    if cfg.load_checkpoint:
+        ckpt_path = cfg.load_checkpoint
+        try:
+            metadata = load_checkpoint(ckpt_path, model, optimizer)
+            start_step = metadata["step"]
+            logger.info(f"Resumed from {ckpt_path} at step {start_step}")
+            # Continue writing into the same directory as the checkpoint
+            run_dir = os.path.dirname(ckpt_path)
+            logger.info(f"Continuing run in {run_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to resume from {ckpt_path}: {e}. Starting fresh.")
 
     # Training loop
     model.train()
@@ -170,16 +189,21 @@ def main(cfg: Config):
             cfg.train.min_lr,
         ) if cfg.train.decay_lr else cfg.train.learning_rate
 
-        # Update learning rate
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        # Respect LR multiplier for alpha group
+        for i, param_group in enumerate(optimizer.param_groups):
+            if i == 0:  # main params
+                param_group["lr"] = lr
+            else:  # alpha group (if present)
+                param_group["lr"] = lr * alpha_lr_multiplier
         metrics["lr"] = lr
 
-        # Forward pass
+        # Forward pass - optionally disable System 2 during early training
         x, y = x.to(device), y.to(device)
         with timed("forward", metrics):
+            # Use System 2 only after warmup period
+            use_refine = step >= cfg.model.warmup_steps_no_refine
             # EBM model returns (loss, logits, metrics)
-            loss, logits, extras = model(x, targets=y, use_refine=True, refine_steps=model_cfg.refine_steps)
+            loss, logits, extras = model(x, targets=y, use_refine=use_refine, refine_steps=model_cfg.refine_steps)
             loss = loss / cfg.train.grad_accum_steps
 
         # Backward pass
