@@ -12,29 +12,36 @@ class ThinkingState:
 
 def refine_logits_once(
     h_last: torch.Tensor,  # [B, d]
-    wte: torch.Tensor,     # [V, d] (unused in minimal path)
+    wte: torch.Tensor,     # [V, d]
     energy_fn,             # callable(h) -> energies [B, V]
     logits: torch.Tensor,  # [B, V]
     step_size: float,
-    tau_entropy: float = 0.0,
+    softmax_temperature: float = 1.0,
+    entropy_weight: float = 0.0,
 ) -> torch.Tensor:
-    """One Langevin/gradient step on relaxed objective over logits.
+    """One closed-form gradient step on relaxed objective over logits.
 
-    Minimal interface assumes `energy_fn(h_last)` returns energies over all tokens: [B, V].
-    We update logits using grad of J = E_p[E] - tau * H(p), where p = softmax(logits).
+    J = E_p[E] - λ H(p), with p = softmax(v / τ).
+    Stop-grad mixture: compute E at p.detach() so gradients do not flow through E's
+    dependence on p inside this step; only the softmax(v/τ) path is differentiated.
+    Closed-form gradient (no autograd in the inner loop):
+      dJ/dp = E_now + λ (log p + 1)
+      ∂J/∂v = (1/τ) · p ⊙ (dJ/dp - ⟨dJ/dp⟩_p)
     """
-    # Detach per-step by default in this utility
-    v = logits.detach().requires_grad_(True)
-    E = energy_fn(h_last)  # [B, V]
-    p = torch.softmax(v, dim=-1)
-    J = (p * E).sum(dim=-1).sum()
-    if tau_entropy and tau_entropy != 0.0:
-        p_safe = p.clamp_min(1e-9)
-        H = -(p_safe * p_safe.log()).sum(dim=-1).sum()
-        J = J - tau_entropy * H
-    (g,) = torch.autograd.grad(J, v, retain_graph=False, create_graph=False)
+    v = logits.detach()  # stop-grad per step
+    tau = max(1e-6, float(softmax_temperature))
+    with torch.no_grad():
+        E = energy_fn(h_last)  # [B, V]
+        p = torch.softmax(v / tau, dim=-1)
+        if entropy_weight and entropy_weight != 0.0:
+            p_safe = p.clamp_min(1e-9)
+            dJdp = E + float(entropy_weight) * (p_safe.log() + 1.0)
+        else:
+            dJdp = E
+        s = (dJdp * p).sum(dim=-1, keepdim=True)
+        g = (p * (dJdp - s)) / tau
     v = v - step_size * g
-    return v.detach()
+    return v
 
 
 def think(
@@ -43,19 +50,27 @@ def think(
     energy_fn,
     steps: int,
     step_size: float,
-    init: str = "random_noise",
-    tau_entropy: float = 0.0,
+    softmax_temperature: float = 1.0,
+    entropy_weight: float = 0.0,
+    init_noise_std: float = 0.0,
 ) -> ThinkingState:
-    """Iterative refinement of next-token logits using energy expectations.
+    """Iterative refinement of next-token logits using closed-form updates.
 
-    This is a minimal, generic version that requires `energy_fn(h_last) -> [B,V]`.
+    Initializes v0 = -E/τ (optionally + tiny noise) and applies steps of
+    closed-form gradient updates under stop-grad mixture.
     """
-    B, _ = h_last.shape
-    V = wte.shape[0]
-    if init == "zeros":
-        logits = torch.zeros(B, V, device=h_last.device)
-    else:
-        logits = torch.randn(B, V, device=h_last.device)
+    E0 = energy_fn(h_last)  # [B, V]
+    logits = (-E0 / max(1e-6, float(softmax_temperature))).clone()
+    if init_noise_std and init_noise_std != 0.0:
+        logits = logits + float(init_noise_std) * torch.randn_like(logits)
     for _ in range(steps):
-        logits = refine_logits_once(h_last, wte, energy_fn, logits, step_size, tau_entropy)
+        logits = refine_logits_once(
+            h_last,
+            wte,
+            energy_fn,
+            logits,
+            step_size,
+            softmax_temperature=softmax_temperature,
+            entropy_weight=entropy_weight,
+        )
     return ThinkingState(logits=logits, steps_done=steps)

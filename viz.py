@@ -1,8 +1,14 @@
-"""vibecoded visualization of nanoEBM
+"""Minimal visualization for nanoEBM (mixture-aware)
 
 Usage examples:
-  python viz.py --checkpoint=out_ebt/final.pt --prompt="ROMEO:" --topk=20
-  python viz.py --checkpoint=out_ebt/final.pt --mode=correlation --batches=4
+  # Expected energy trace (gap across inner steps)
+  python viz.py --checkpoint=out_ebt/final.pt --mode=gap --steps=8
+
+  # Bowl panels (export-only; not realtime): a dot descending as energy drops
+  python viz.py --checkpoint=out_ebt/final.pt --mode=bowl_panels --steps=8
+
+  # Bowl GIF animation (export-only)
+  python viz.py --checkpoint=out_ebt/final.pt --mode=bowl_anim --steps=8
 """
 
 from __future__ import annotations
@@ -51,38 +57,41 @@ class VizConfig:
     checkpoint: str | None = None  # None = auto-detect latest
     data_path: str = "shakespeare.txt"
     prompt: str = "ROMEO:"
-    topk: int = 20
-    # modes: legacy: "topk", "correlation"; new: "gap", "trajectories", "shift", "margin", "eval",
-    # plus curve-style energy visuals: "curve" (panels) and "curve_anim" (GIF), or "all"
-    mode: str = "topk"
-    batches: int = 2     # for correlation mode
+    # single mode: expected energy gap across steps
+    mode: str = "gap"
     # thinking loop params for analysis
     steps: int = 8
-    tau: float = 0.5
+    tau: float = 1.0
     lr: float | None = None
     noise: float = 0.0
     topk_think: int = 32
     batch_size: int = 32
+    # per-token visualization
+    tokens: int = 3                 # how many new tokens to visualize (generation)
+    per_token_anim: bool = False    # export per-token GIFs instead of panels
+    multi_trajectories: int = 1     # run multiple noisy refinements and compare
+    # early stop in inner loop (viz only)
+    early_stop: bool = True
+    early_stop_delta: float = 1e-4
+    early_stop_ginf: float = 1e-3
+    # animation writer preference
+    writer: str = "auto"            # auto|gif|mp4
+    curve_from_prompt: bool = True   # use the prompt example for curve plots
     # outputs
-    out_topk: str = "out_ebt/energies_topk.png"
-    out_corr: str = "out_ebt/energy_vs_ce.png"
     out_gap: str = "out_ebt/expected_energy_gap.png"
-    out_traj: str = "out_ebt/token_logit_trajectories.png"
-    out_shift: str = "out_ebt/expected_energy_hist_shift.png"
-    out_margin: str = "out_ebt/energy_margin_report.txt"
-    out_eval: str = "out_ebt/eval_report.txt"
-    # curve-style outputs
     out_curve_panels: str = "out_ebt/energy_curve_panels.png"
     out_curve_anim: str = "out_ebt/energy_curve.gif"
-    curve_from_prompt: bool = True  # when False, use a small train batch mean
-    # surface-style landscape of J(v) over a 2D plane in logits space
-    out_surface3d: str = "out_ebt/energy_surface3d.png"
+    # misc outputs used by helper modes
+    out_topk: str = "out_ebt/topk_energies.png"
+    out_corr: str = "out_ebt/energy_ce_correlation.png"
+    out_surface3d: str = "out_ebt/energy_surface_3d.png"
     out_surface_contour: str = "out_ebt/energy_surface_contour.png"
-    out_surface_anim: str = "out_ebt/energy_surface_traj.gif"
-    surface_grid: int = 60          # grid resolution per axis
-    surface_span: float = 6.0       # +/- span around v0 for the two dims (logit units)
-    surface_dim_i: int | None = None  # choose 2 dims in candidate set; None => auto by |grad|
-    surface_dim_j: int | None = None
+    out_surface_anim: str = "out_ebt/energy_surface.gif"
+    out_traj: str = "out_ebt/token_logit_trajectories.png"
+    out_margin: str = "out_ebt/energy_margin.txt"
+    out_eval: str = "out_ebt/eval_report.txt"
+    out_shift: str = "out_ebt/trajectory_shift.png"
+    out_token_dir: str = "out_ebt/per_token"
 
 
 @torch.no_grad()
@@ -195,7 +204,16 @@ def _encode_prompt(ds: CharDataset, prompt: str, device: str):
     return torch.tensor([ids], dtype=torch.long, device=device)
 
 
-def _think_trace_last(model: EBTLanguageModel, idx: torch.Tensor, steps: int, tau: float, lr: float | None, noise: float, topk: int | None):
+def _think_trace_last(model: EBTLanguageModel,
+                      idx: torch.Tensor,
+                      steps: int,
+                      tau: float,
+                      lr: float | None,
+                      noise: float,
+                      topk: int | None,
+                      early_stop: bool = False,
+                      es_delta: float = 1e-4,
+                      es_ginf: float = 1e-3):
     device = idx.device
     # context and energies at last position
     idx_cond = idx[:, -model.gpt_cfg.block_size :]
@@ -218,6 +236,7 @@ def _think_trace_last(model: EBTLanguageModel, idx: torch.Tensor, steps: int, ta
     abs_clamp = float(getattr(model.ebt_cfg, "absolute_clamp", 0.0) or 0.0)
 
     expected_en = []
+    grad_inf = []
     logit_trajs = []  # only for B=1 to keep plots readable
 
     def expected_energy_from(v_):
@@ -239,11 +258,13 @@ def _think_trace_last(model: EBTLanguageModel, idx: torch.Tensor, steps: int, ta
 
     # step 0
     with torch.no_grad():
-        expected_en.append(float(expected_energy_from(v).mean().detach().cpu()))
+        e0 = float(expected_energy_from(v).mean().detach().cpu())
+        expected_en.append(e0)
         if B == 1:
             logit_trajs.append(v.detach().cpu().clone())
 
-    for _ in range(steps):
+    stop_idx = None
+    for k in range(steps):
         v = v.detach().requires_grad_(True)
         p = torch.softmax(v / tau, dim=-1)
         # relaxed E and entropy
@@ -260,11 +281,19 @@ def _think_trace_last(model: EBTLanguageModel, idx: torch.Tensor, steps: int, ta
         if noise and noise > 0:
             v = v + noise * torch.randn_like(v)
         with torch.no_grad():
-            expected_en.append(float(expected_energy_from(v).mean().detach().cpu()))
+            en_k = float(expected_energy_from(v).mean().detach().cpu())
+            expected_en.append(en_k)
+            ginfn = float(g.detach().abs().max().cpu())
+            grad_inf.append(ginfn)
             if B == 1:
                 logit_trajs.append(v.detach().cpu().clone())
+            # early stop checks
+            if early_stop and stop_idx is None:
+                if len(expected_en) >= 2:
+                    if abs(expected_en[-1] - expected_en[-2]) < es_delta or ginfn < es_ginf:
+                        stop_idx = k + 1  # steps are 1-based relative to initial state
 
-    return expected_en, logit_trajs, cand_idx
+    return expected_en, logit_trajs, cand_idx, grad_inf
 
 
 def _surface_objective_and_grad(model: EBTLanguageModel,
@@ -341,7 +370,10 @@ def plot_expected_energy_gap(model: EBTLanguageModel, ds: CharDataset, cfg: VizC
     loader, _ = get_loader(cfg.data_path, model.gpt_cfg.block_size, batch_size=cfg.batch_size, split="train")
     x, _ = next(iter(loader))
     x = x.to(device)
-    en_trace, _, _ = _think_trace_last(model, x, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think)
+    en_trace, _, _, _ = _think_trace_last(
+        model, x, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think,
+        early_stop=cfg.early_stop, es_delta=cfg.early_stop_delta, es_ginf=cfg.early_stop_ginf
+    )
     import numpy as np
     xs = np.arange(len(en_trace))
     plt.figure(figsize=(6, 4))
@@ -356,10 +388,47 @@ def plot_expected_energy_gap(model: EBTLanguageModel, ds: CharDataset, cfg: VizC
     print(f"Saved: {cfg.out_gap}")
 
 
+def plot_expected_energy_gap_multi(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
+    """Overlay multiple energy traces (different noisy refinements) on one plot."""
+    import numpy as np
+    device = next(model.parameters()).device
+    # seed example from prompt
+    idx = _encode_prompt(ds, cfg.prompt, device)
+    traces = []
+    Ks = max(1, int(cfg.multi_trajectories))
+    for j in range(Ks):
+        en_trace, _, _, _ = _think_trace_last(
+            model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr,
+            noise=cfg.noise, topk=cfg.topk_think,
+            early_stop=cfg.early_stop, es_delta=cfg.early_stop_delta, es_ginf=cfg.early_stop_ginf,
+        )
+        traces.append(np.asarray(en_trace, dtype=float))
+    # Normalize each to its own [min,max] for readability? Keep absolute values to compare.
+    xs = np.arange(max(len(t) for t in traces))
+    plt.figure(figsize=(7, 4))
+    for j, t in enumerate(traces):
+        plt.plot(np.arange(len(t)), t, marker='o', alpha=0.7, label=f"run {j+1}")
+    plt.xlabel("inner step k")
+    plt.ylabel("E_p[E]")
+    plt.title(f"Expected energy traces (K={Ks} runs)")
+    plt.legend(ncol=2, fontsize=8)
+    plt.grid(True, alpha=0.2)
+    _ensure_dir(cfg.out_gap)
+    out = cfg.out_gap.rsplit('.', 1)
+    out_path = out[0] + "_multi." + (out[1] if len(out) > 1 else "png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
 def plot_token_logit_trajectories(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
     device = next(model.parameters()).device
     idx = _encode_prompt(ds, cfg.prompt, device)
-    en_trace, logit_trajs, cand_idx = _think_trace_last(model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think)
+    en_trace, logit_trajs, cand_idx, _ = _think_trace_last(
+        model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think,
+        early_stop=cfg.early_stop, es_delta=cfg.early_stop_delta, es_ginf=cfg.early_stop_ginf
+    )
     if not logit_trajs:
         print("Token logit trajectories require B=1; using prompt mode for a single example.")
         return
@@ -636,8 +705,9 @@ def _energy_trace_for_curve(model: EBTLanguageModel, ds: CharDataset, cfg: VizCo
         loader, _ = get_loader(cfg.data_path, model.gpt_cfg.block_size, batch_size=cfg.batch_size, split="train")
         x, _ = next(iter(loader))
         idx = x.to(device)
-    en_trace, _, _ = _think_trace_last(
-        model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think
+    en_trace, _, _, _ = _think_trace_last(
+        model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think,
+        early_stop=cfg.early_stop, es_delta=cfg.early_stop_delta, es_ginf=cfg.early_stop_ginf
     )
     return en_trace
 
@@ -699,11 +769,20 @@ def animate_energy_curve(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfi
     """
     import numpy as np
     from matplotlib.animation import FuncAnimation
+    # Writer selection: prefer requested writer, else auto-try GIF then MP4.
+    writer_pref = (cfg.writer or "auto").lower()
+    pillow_ok = False
+    ffmpeg_ok = False
     try:
         from matplotlib.animation import PillowWriter
         pillow_ok = True
     except Exception:
         pillow_ok = False
+    try:
+        from matplotlib.animation import FFMpegWriter
+        ffmpeg_ok = True
+    except Exception:
+        ffmpeg_ok = False
 
     en = np.asarray(_energy_trace_for_curve(model, ds, cfg), dtype=float)
     e_min, e_max = float(en.min()), float(en.max())
@@ -729,24 +808,159 @@ def animate_energy_curve(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfi
 
     anim = FuncAnimation(fig, update, frames=len(en), interval=600, blit=True)
 
-    if pillow_ok:
+    # Decide writer
+    saved = False
+    if writer_pref in ("gif", "auto") and pillow_ok:
         try:
+            from matplotlib.animation import PillowWriter
             writer = PillowWriter(fps=2)
             _ensure_dir(cfg.out_curve_anim)
             anim.save(cfg.out_curve_anim, writer=writer)
             print(f"Saved: {cfg.out_curve_anim}")
+            saved = True
         except Exception as e:
-            print(f"Could not save GIF ({e}). Showing panels instead.")
-            plt.close(fig)
-            plot_energy_curve_panels(model, ds, cfg)
-            return
-    else:
-        print("PillowWriter not available; saving panels instead of GIF.")
+            print(f"Could not save GIF ({e}).")
+    if not saved and writer_pref in ("mp4", "auto") and ffmpeg_ok:
+        try:
+            from matplotlib.animation import FFMpegWriter
+            _ensure_dir(cfg.out_curve_anim)
+            mp4_path = cfg.out_curve_anim.rsplit('.', 1)[0] + '.mp4'
+            writer = FFMpegWriter(fps=2)
+            anim.save(mp4_path, writer=writer)
+            print(f"Saved: {mp4_path}")
+            saved = True
+        except Exception as e:
+            print(f"Could not save MP4 ({e}).")
+    if not saved:
+        print("Falling back to static panels.")
         plt.close(fig)
         plot_energy_curve_panels(model, ds, cfg)
         return
 
     plt.close(fig)
+
+
+def _save_bowl_from_trace(en: list[float], path_panels: str | None, path_anim: str | None, writer_pref: str = "auto"):
+    """Utility: save bowl panels or animation directly from a precomputed energy trace."""
+    import numpy as np
+    en = np.asarray(en, dtype=float)
+    if path_panels is not None:
+        # render a simple one-off panels figure
+        Kp1 = en.shape[0]
+        e_min, e_max = float(en.min()), float(en.max())
+        rng = max(1e-8, e_max - e_min)
+        en_norm = (en - e_min) / rng
+        xs = np.linspace(-1.2, 1.2, 400)
+        bowl = np.clip(xs**2, 0.0, 1.0)
+        cols = min(6, Kp1)
+        rows = int(np.ceil(Kp1 / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(3.1 * cols, 2.4 * rows))
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+        axes = axes.flatten()
+        x_pos = -np.sqrt(np.clip(en_norm, 0.0, 1.0))
+        for i in range(Kp1):
+            ax = axes[i]
+            ax.plot(xs, bowl, color="#6e8efb", linewidth=3)
+            ax.scatter([x_pos[i]], [en_norm[i]], s=80, color="#111111", zorder=5)
+            ax.set_title(f"Step {i}")
+            ax.set_xlim(-1.3, 1.3)
+            ax.set_ylim(-0.05, 1.05)
+            ax.axis("off")
+        for j in range(Kp1, axes.size):
+            axes[j].axis("off")
+        _ensure_dir(path_panels)
+        plt.tight_layout()
+        plt.savefig(path_panels, dpi=150)
+        plt.close(fig)
+    if path_anim is not None:
+        # simple dot animation
+        from matplotlib.animation import FuncAnimation
+        writer_pref = (writer_pref or "auto").lower()
+        pillow_ok = ffmpeg_ok = False
+        try:
+            from matplotlib.animation import PillowWriter
+            pillow_ok = True
+        except Exception:
+            pass
+        try:
+            from matplotlib.animation import FFMpegWriter
+            ffmpeg_ok = True
+        except Exception:
+            pass
+        xs = np.linspace(-1.2, 1.2, 400)
+        bowl = np.clip(xs**2, 0.0, 1.0)
+        e_min, e_max = float(en.min()), float(en.max())
+        rng = max(1e-8, e_max - e_min)
+        en_norm = (en - e_min) / rng
+        x_pos = -np.sqrt(np.clip(en_norm, 0.0, 1.0))
+        fig, ax = plt.subplots(figsize=(5, 3.2))
+        ax.plot(xs, bowl, color="#6e8efb", linewidth=3)
+        dot = ax.scatter([x_pos[0]], [en_norm[0]], s=120, color="#111111", zorder=5)
+        txt = ax.text(0.02, 0.92, f"Step 0\nE={en[0]:.4f}", transform=ax.transAxes)
+        ax.set_xlim(-1.3, 1.3)
+        ax.set_ylim(-0.05, 1.05)
+        ax.axis("off")
+        ax.set_title("Energy Descent (lower is better)")
+        def update(f):
+            dot.set_offsets([[x_pos[f], en_norm[f]]])
+            txt.set_text(f"Step {f}\nE={en[f]:.4f}")
+            return dot, txt
+        anim = FuncAnimation(fig, update, frames=len(en), interval=600, blit=True)
+        saved = False
+        if writer_pref in ("gif", "auto") and pillow_ok:
+            try:
+                from matplotlib.animation import PillowWriter
+                writer = PillowWriter(fps=2)
+                _ensure_dir(path_anim)
+                anim.save(path_anim, writer=writer)
+                saved = True
+            except Exception:
+                pass
+        if not saved and writer_pref in ("mp4", "auto") and ffmpeg_ok:
+            try:
+                from matplotlib.animation import FFMpegWriter
+                mp4_path = path_anim.rsplit('.', 1)[0] + '.mp4'
+                writer = FFMpegWriter(fps=2)
+                _ensure_dir(mp4_path)
+                anim.save(mp4_path, writer=writer)
+                saved = True
+            except Exception:
+                pass
+        if not saved:
+            plt.close(fig)
+            # fallback: save first/last panels side by side
+            path = path_anim.rsplit('.', 1)
+            path_pan = path[0] + "_panels.png"
+            _save_bowl_from_trace(en.tolist(), path_panels=path_pan, path_anim=None, writer_pref=writer_pref)
+            return
+        plt.close(fig)
+
+
+def per_token_bowl_visuals(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
+    """Generate last-N per-token bowl visuals (panels or GIF) by iterating generation.
+    Uses the prompt as the starting context; each iteration visualizes the inner loop
+    for the next token and then appends that token to the context.
+    """
+    device = next(model.parameters()).device
+    idx = _encode_prompt(ds, cfg.prompt, device)
+    _ensure_dir(cfg.out_token_dir)
+    for t in range(max(1, int(cfg.tokens))):
+        # energy trace for this token's refinement from current context
+        en_trace, _, _, _ = _think_trace_last(
+            model, idx, steps=cfg.steps, tau=cfg.tau, lr=cfg.lr, noise=cfg.noise, topk=cfg.topk_think,
+            early_stop=cfg.early_stop, es_delta=cfg.early_stop_delta, es_ginf=cfg.early_stop_ginf
+        )
+        # save panels or animation
+        base = f"{cfg.out_token_dir}/token_{t+1:02d}"
+        if cfg.per_token_anim:
+            _save_bowl_from_trace(en_trace, path_panels=None, path_anim=base + ".gif", writer_pref=cfg.writer)
+        else:
+            _save_bowl_from_trace(en_trace, path_panels=base + ".png", path_anim=None, writer_pref=cfg.writer)
+        # generate the next token to advance context
+        out = model.generate_think(idx.clone(), max_new_tokens=1, steps=cfg.steps, lr=(cfg.lr or float(model.alpha.detach().clamp(min=1e-6).item())),
+                                   temp=cfg.tau, entropy=0.0, noise=cfg.noise, topk=cfg.topk_think, sample=False)
+        idx = out
 
 @torch.no_grad()
 def energy_margin_report(model: EBTLanguageModel, ds: CharDataset, cfg: VizConfig):
@@ -866,40 +1080,30 @@ def main(cfg: VizConfig):
 
     ds = CharDataset(cfg.data_path, block_size=model_cfg.block_size, split="train")
 
-    if cfg.mode == "topk":
-        visualize_topk(model, ds, cfg)
-    elif cfg.mode == "correlation":
-        visualize_correlation(model, ds, cfg)
-    elif cfg.mode == "gap":
+    if cfg.mode == "gap":
         plot_expected_energy_gap(model, ds, cfg)
-    elif cfg.mode == "trajectories":
+    elif cfg.mode in ("gap_multi",):
+        plot_expected_energy_gap_multi(model, ds, cfg)
+    elif cfg.mode in ("traj", "trajectories"):
         plot_token_logit_trajectories(model, ds, cfg)
-    elif cfg.mode == "shift":
-        hist_expected_energy_shift(model, ds, cfg)
-    elif cfg.mode == "margin":
-        energy_margin_report(model, ds, cfg)
-    elif cfg.mode == "eval":
-        eval_report(model, ds, cfg)
-    elif cfg.mode == "curve":
+    elif cfg.mode in ("bowl", "bowl_panels"):
         plot_energy_curve_panels(model, ds, cfg)
-    elif cfg.mode == "curve_anim":
+    elif cfg.mode in ("bowl_anim", "bowl_gif", "anim"):
         animate_energy_curve(model, ds, cfg)
-    elif cfg.mode == "surface":
+    elif cfg.mode in ("surface3d", "surface"):
         plot_energy_surface(model, ds, cfg, make_anim=False)
-    elif cfg.mode == "surface_anim":
+    elif cfg.mode in ("surface_anim", "surface_gif"):
         plot_energy_surface(model, ds, cfg, make_anim=True)
-    elif cfg.mode == "all":
-        visualize_topk(model, ds, cfg)
-        visualize_correlation(model, ds, cfg)
-        plot_expected_energy_gap(model, ds, cfg)
-        plot_token_logit_trajectories(model, ds, cfg)
-        hist_expected_energy_shift(model, ds, cfg)
+    elif cfg.mode in ("margin",):
         energy_margin_report(model, ds, cfg)
+    elif cfg.mode in ("eval",):
         eval_report(model, ds, cfg)
-        plot_energy_curve_panels(model, ds, cfg)
-        animate_energy_curve(model, ds, cfg)
+    elif cfg.mode in ("per_token", "per_token_bowl"):
+        per_token_bowl_visuals(model, ds, cfg)
     else:
-        raise ValueError(f"Unknown mode: {cfg.mode}")
+        raise ValueError(
+            f"Unknown mode: {cfg.mode}. Supported: gap, gap_multi, traj, bowl_panels (bowl), bowl_anim (bowl_gif, anim), surface3d (surface), surface_anim, margin, eval, per_token."
+        )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ Usage:
     python train.py model.n_layer=12 data.batch_size=128
     python train.py wandb_project=nanoebm
     # train with step size learning (refinement)
-    python train.py model.refine_steps=2 model.truncate_refine=True model.detach_refine=True model.refine_step_size_learnable=True
+    python train.py model.think_steps=2 model.truncate_refine=true model.detach_refine=true model.think_lr_learnable=true
 """
 
 import os
@@ -76,7 +76,11 @@ def main(cfg: Config):
 
     # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
-    alpha_lr_multiplier = getattr(model_cfg, 'refine_step_size_lr_multiplier', 3.0)
+    alpha_lr_multiplier = (
+        getattr(model_cfg, 'think_lr_lr_multiplier', None)
+        if getattr(model_cfg, 'think_lr_lr_multiplier', None) is not None
+        else getattr(model_cfg, 'refine_step_size_lr_multiplier', 3.0)
+    )
     
     # Separate parameters into alpha and non-alpha groups
     alpha_params = []

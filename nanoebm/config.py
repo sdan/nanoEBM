@@ -15,35 +15,49 @@ class ModelConfig:
     dropout: float = 0.1
     bias: bool = True
 
-    # EBM thinking parameters
-    # Use simple lm_head-as-energy (E = -logits / T) instead of EnergyHead
-    use_lm_head_as_energy: bool = True
-    energy_temperature: float = 1.0
-    energy_hidden: int = 4
-    use_shared_embeddings: bool = True
+    # EBM thinking parameters (single refinement path by default)
+    # Closed-form, stop-grad mixture refinement (no autograd.grad in inner loop)
 
-    # Iterative refinement (NOT MCMC): gradient descent on logits to minimize expected energy.
-    # Iterative refinement config
-    refine_steps: int = 0  # Number of refinement steps (0 = no refinement)
-    refine_step_size: float = 1.0  # Step size (learning rate) for refinement updates
-    refine_step_size_learnable: bool = False  # Make step size a learnable parameter
-    langevin_noise: float = 0.0  # Optional noise for Langevin dynamics (usually 0)
-    # Step size optimizer behavior
-    refine_step_size_lr_multiplier: float = 3.0
-    # Refinement loop stability/behavior toggles (still not MCMC!)
-    detach_refine: bool = True  # Detach per-step by default for stability
-    truncate_refine: bool = False  # Backprop only through final step
-    denoising_initial_condition: str = "random_noise"  # random_noise | zeros
-    refine_last_position_only: bool = True  # train-time simplification (Phase 1)
-    clamp_update_max_change: float = 0.25  # per-step delta clamp in logit space (0 disables)
-    absolute_clamp: float = 6.0  # keep logits sane under bf16/AMP (0 disables)
+    # Core scalars
+    softmax_temperature: float = 1.0  # τ: p = softmax(v / τ)
+    entropy_weight: float = 0.0       # λ: J = E_p[E] - λ H(p)
+
+    # Iterative refinement (gradient descent on logits)
+    think_steps: int = 0              # number of refinement steps (0 = no refinement)
+    think_lr: float = 1.0             # step size for refinement (learnable scalar in model)
+    think_lr_learnable: bool = False  # whether the step size parameter is learnable
+    think_lr_lr_multiplier: float = 3.0  # optimizer LR multiplier for the step size parameter
+
+    # Stability/behavior
+    detach_refine: bool = True        # detach per-step by default (stop-grad through steps)
+    truncate_refine: bool = False     # backprop only through the final step
+    refine_last_position_only: bool = True  # train-time simplification
+    think_max_move: float = 0.25      # per-step delta clamp in logit space (0 disables)
+    absolute_clamp: float = 6.0       # keep logits bounded (0 disables)
     soften_target_prob_dist: float = 0.0  # label smoothing over steps
-    entropy_reg_tau: float = 0.5  # optional entropy regularizer in step objective
-    # Auxiliary CE weight to directly teach the energy head via CE on -E
-    aux_ce_weight: float = 0.5
+    langevin_noise: float = 0.0       # optional noise (usually 0)
+    think_init: str = "base_energy"   # base_energy|zeros|random
+    think_init_noise_std: float = 0.0 # optional tiny init noise on v0
+    mixture_stopgrad: bool = True     # stop-grad mixture by default; set False for coupled
+
+    # Hidden toggle for future coupled refinement (gradients flow through mixture)
+    coupled_refine: bool = False
+
+    # Loss combine: (1-λ_aux) * CE(v_T) + λ_aux * CE(-E_base)
+    aux_ce_weight: float = 0.1
+
     # Optional logging of expected energy trace across steps (mean over active positions)
     log_expected_energy_trace: bool = False
-    # Removed unused randomization options to simplify config
+
+    # Back-compat aliases (deprecated): keep for loading older checkpoints/configs
+    # They are not referenced in new code paths but may appear in saved configs.
+    refine_steps: int | None = None
+    refine_step_size: float | None = None
+    refine_step_size_learnable: bool | None = None
+    refine_step_size_lr_multiplier: float | None = None
+    clamp_update_max_change: float | None = None
+    entropy_reg_tau: float | None = None
+    denoising_initial_condition: str | None = None
 
 
 @chz.chz

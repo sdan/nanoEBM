@@ -53,12 +53,12 @@ class SampleConfig:
     
     # Thinking/refinement parameters
     use_thinking: bool = True  # Default to thinking mode (always refine)
-    think_steps: int = 4  # Number of refinement steps
-    think_lr: float = 0.5  # Step size for refinement
-    think_tau: float = 1.0  # Temperature for softmax (distribution sharpness)
-    think_entropy: float = 0.1  # Entropy weight in relaxed objective
-    think_noise: float = 0.0  # Noise level for Langevin dynamics
-    topk: int | None = 50  # Restrict to top-k tokens (None = use all vocab)
+    think_steps: int = 4       # Number of refinement steps
+    think_lr: float = 0.5      # Step size for refinement
+    softmax_temperature: float = 1.0  # τ for softmax during refinement
+    entropy_weight: float = 0.1       # λ in J = E_p[E] - λ H(p)
+    think_noise: float = 0.0   # Noise level for Langevin dynamics
+    topk: int | None = 50      # Restrict to top-k tokens (None = use all vocab)
     # Decoding controls (when use_thinking=True)
     sample: bool = False  # Sample from refined logits instead of argmax
     sample_temp: float = 1.0  # Sampling temperature
@@ -113,8 +113,8 @@ def main(cfg: SampleConfig):
             max_new_tokens=cfg.max_new_tokens,
             steps=cfg.think_steps,
             lr=cfg.think_lr,
-            temp=cfg.think_tau,
-            entropy=cfg.think_entropy,
+            temp=cfg.softmax_temperature,
+            entropy=cfg.entropy_weight,
             noise=cfg.think_noise,
             topk=cfg.topk,
             sample=cfg.sample,
