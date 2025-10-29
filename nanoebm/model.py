@@ -146,9 +146,18 @@ class EBM(nn.Module):
             else:
                 steps = self.config.refine_steps
         
-        # Initialize logits from System 1 (stable initialization)
-        # Disable random init and replay buffer for now (stability)
-        logits = -energies.clone()  # S1 initialization
+        # Initialize logits - use replay buffer if available
+        if self.config.use_replay_buffer and self.replay_buffer.has_samples() and self.training:
+            # Warm-start from replay buffer
+            sample = self.replay_buffer.sample(1).to(device)
+            if sample.shape[1] == T and sample.shape[2] == V:
+                # Expand the single sample to match current batch size
+                logits = sample[0].unsqueeze(0).expand(B, T, V).clone()
+            else:
+                logits = -energies.clone()  # Fallback to S1 if shape mismatch
+        else:
+            logits = -energies.clone()  # S1 initialization
+        
         logits = logits.requires_grad_(True)
         
         trajectory = [logits.clone()] if return_trajectory else []
@@ -188,10 +197,10 @@ class EBM(nn.Module):
             # Gradient descent step
             logits = logits - step_size * grad.clamp(-5, 5)
             
-            # Disable Langevin noise initially for stability
-            # if self.training and step < steps - 1:
-            #     noise_scale = self.config.langevin_noise * (1.0 - step / steps)
-            #     logits = logits + noise_scale * torch.randn_like(logits)
+            # Add Langevin noise for exploration (only during training)
+            if self.config.langevin_noise > 0 and self.training and step < steps - 1:
+                noise_scale = self.config.langevin_noise * (1.0 - step / steps)  # Decay noise
+                logits = logits + noise_scale * torch.randn_like(logits)
             
             # Center logits for numerical stability
             logits = logits - logits.mean(dim=-1, keepdim=True)
@@ -214,9 +223,9 @@ class EBM(nn.Module):
                     early_stop_patience = 0
             prev_energy = current_energy
         
-        # Disable replay buffer initially for stability
-        # if self.training and T == self.config.block_size:
-        #     self.replay_buffer.add(logits[0].detach())
+        # Store refined logits in replay buffer for future warm-starts
+        if self.config.use_replay_buffer and self.training and T == self.config.block_size:
+            self.replay_buffer.add(logits[0].detach())
         
         if return_trajectory:
             return logits, trajectory
