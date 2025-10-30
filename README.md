@@ -71,3 +71,43 @@ model.mixture_stopgrad=true
 train.max_steps=5000
 train.learning_rate=3e-4
 ```
+
+```bash
+# Train with contrastive divergence (CD-1) - shapes energy landscape with negative samples
+uv run python train.py model.use_contrastive=true
+
+# Train with persistent contrastive divergence (PCD) - maintains sample chains across batches
+uv run python train.py model.use_contrastive=true model.contrastive_type=pcd
+
+# Train with Fast PCD - best for exploration with momentum-based sampling
+uv run python train.py model.use_contrastive=true model.contrastive_type=fast_pcd
+
+# Full example with custom contrastive settings
+uv run python train.py \
+  model.use_contrastive=true \
+  model.contrastive_type=cd \
+  model.contrastive_k=5 \
+  model.contrastive_weight=0.2 \
+  model.langevin_step_size=0.01 \
+  model.langevin_noise_scale=0.005
+
+# Basic contrastive divergence test
+uv run python train.py \
+  model.use_contrastive=true \
+  model.contrastive_weight=0.1 \
+  train.max_steps=100
+
+# PCD for better mixing
+uv run python train.py \
+  model.use_contrastive=true \
+  model.contrastive_type=pcd \
+  model.contrastive_weight=0.2 \
+  train.max_steps=100
+
+# Conservative CD settings
+uv run python train.py \
+  model.use_contrastive=true \
+  model.contrastive_weight=0.01 \
+  model.contrastive_k=1 \
+  train.max_steps=100
+```
