@@ -11,7 +11,7 @@ $$x_{t+1} = x_t - \alpha \nabla_x E(x) + \text{noise}$$
 - **∇_x E(x)**: gradient of energy w.r.t. prediction
 - Repeat a few refinement steps (typically 2–4)
 
-an energy-based model is a model trained to minimize a function. if we train a transformer to minize a function it learns to reason about the input implicitly as we iterate
+An energy-based model is a model trained to minimize a function. if we train a transformer to minize a function it learns to reason about the input implicitly as we iterate
 
 this current implementation is character-level on shakespeare.txt with a block size of 256.
 
@@ -45,6 +45,18 @@ uv run python sample.py \
 uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=false
 ```
 
+Some good reading:
+
+[Yann LeCun Energy-Based Models](https://atcold.github.io/NYU-DLSP20/en/week07/07-1/)
+
+[EBT](https://alexiglad.github.io/blog/2025/ebt/)
+
+[EBT paper](https://energy-based-transformers.github.io/static/pdfs/paper.pdf)
+
+[EBT Tutotial](https://github.com/phlippe/uvadlc_notebooks/blob/master/docs/tutorial_notebooks/tutorial8/Deep_Energy_Models.ipynb)
+
+---------
+
 Common overrides
 ```bash
 # data
@@ -64,6 +76,7 @@ model.mixture_stopgrad=true
 train.max_steps=5000
 train.learning_rate=3e-4
 ```
+
 
 ```bash
 # Train with contrastive divergence (CD-1) - shapes energy landscape with negative samples
@@ -124,6 +137,9 @@ uv run python train.py \
     wandb_project=nanoebm \
     wandb_name=h100_8L_512d_pcd10_shakespeare
 ```
+
+
+
 <img width="800" alt="final_landscape" src="https://github.com/user-attachments/assets/4216efb5-655b-460b-91b1-d2a6ab29f1ec" />
 
 <img width="800" alt="final_unified" src="https://github.com/user-attachments/assets/bb90420d-3887-468f-9e6b-a6853501c703" />
