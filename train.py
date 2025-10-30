@@ -6,8 +6,7 @@ Usage:
     python train.py train.learning_rate=1e-3 train.max_steps=5000
     python train.py model.n_layer=12 data.batch_size=128
     python train.py wandb_project=nanoebm
-    # train with step size learning (refinement)
-    python train.py model.think_steps=2 model.truncate_refine=true model.detach_refine=true model.think_lr_learnable=true
+
 """
 
 import os

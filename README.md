@@ -1,9 +1,10 @@
 # nanoEBM
 
+<img width="800" alt="arvsebm" src="https://github.com/user-attachments/assets/66d8432e-bb45-4d82-91e8-d83540ef37d6" />
+
 key idea:
-```
-x_{t+1} = x_t - α ∇_x E(x) + noise
-```
+
+$$x_{t+1} = x_t - \alpha \nabla_x E(x) + \text{noise}$$
 - **x**: current prediction (logits for text, embeddings for vision)
 - **E(x)**: energy function (low energy = good prediction)
 - **α**: learnable step size
@@ -14,25 +15,17 @@ an energy-based model is a model trained to minimize a function. if we train a t
 
 this current implementation is character-level on shakespeare.txt with a block size of 256.
 
-Quick commands
-
 Training
 ```bash
 uv sync
 
 # default training
-uv run python train.py
-
-# train with refinement and learnable step size
-uv run python train.py \
-  model.think_steps=2 \
-  model.truncate_refine=true \
-  model.detach_refine=true \
-  model.think_lr_learnable=true
+uv run python train.py model.use_contrastive=true
 
 # enable W&B logging (optional)
 uv run python train.py wandb_project=nanoebm
 ```
+<img width="800" alt="Screenshot 2025-10-29 at 7 05 52 PM" src="https://github.com/user-attachments/assets/745d456c-ce9a-41be-b363-8ea75f52d540" />
 
 Sampling
 ```bash
@@ -48,7 +41,7 @@ uv run python sample.py \
   use_thinking=true think_steps=4 topk=64 \
   sample=true sample_temp=1.2 sample_top_p=0.9
 
-# disable refinement (greedy via energy argmin)
+# greedy
 uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=false
 ```
 
@@ -110,12 +103,30 @@ uv run python train.py \
   model.contrastive_weight=0.01 \
   model.contrastive_k=1 \
   train.max_steps=100
+
+# train super long
+!uv run python train.py \
+    model.n_layer=8 \
+    model.n_head=8 \
+    model.n_embd=512 \
+    model.refine_steps=6 \
+    model.dropout=0.2 \
+    model.use_contrastive=true \
+    model.contrastive_type=pcd \
+    model.contrastive_k=10 \
+    model.contrastive_weight=0.15 \
+    model.n_persistent=500 \
+    data.batch_size=128 \
+    data.block_size=256 \
+    train.max_steps=10000 \
+    train.learning_rate=6e-4 \
+    train.compile=true \
+    wandb_project=nanoebm \
+    wandb_name=h100_8L_512d_pcd10_shakespeare
 ```
-![final_landscape](https://github.com/user-attachments/assets/4216efb5-655b-460b-91b1-d2a6ab29f1ec)
-![arvsebm](https://github.com/user-attachments/assets/66d8432e-bb45-4d82-91e8-d83540ef37d6)
-<img width="2234" height="740" alt="final_unified" src="https://github.com/user-attachments/assets/bb90420d-3887-468f-9e6b-a6853501c703" />
+<img width="800" alt="final_landscape" src="https://github.com/user-attachments/assets/4216efb5-655b-460b-91b1-d2a6ab29f1ec" />
+
+<img width="800" alt="final_unified" src="https://github.com/user-attachments/assets/bb90420d-3887-468f-9e6b-a6853501c703" />
 
 
-
-<img width="1140" height="623" alt="Screenshot 2025-10-29 at 7 05 52 PM" src="https://github.com/user-attachments/assets/745d456c-ce9a-41be-b363-8ea75f52d540" />
-<img width="871" height="661" alt="Screenshot 2025-10-29 at 10 24 16 AM" src="https://github.com/user-attachments/assets/12f2d62d-3fcd-4f26-ba1e-e0c2d5d05dd0" />
+<img width="800" alt="Screenshot 2025-10-29 at 10 24 16 AM" src="https://github.com/user-attachments/assets/12f2d62d-3fcd-4f26-ba1e-e0c2d5d05dd0" />
