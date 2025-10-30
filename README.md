@@ -111,3 +111,11 @@ uv run python train.py \
   model.contrastive_k=1 \
   train.max_steps=100
 ```
+![final_landscape](https://github.com/user-attachments/assets/4216efb5-655b-460b-91b1-d2a6ab29f1ec)
+![arvsebm](https://github.com/user-attachments/assets/66d8432e-bb45-4d82-91e8-d83540ef37d6)
+<img width="2234" height="740" alt="final_unified" src="https://github.com/user-attachments/assets/bb90420d-3887-468f-9e6b-a6853501c703" />
+
+
+
+<img width="1140" height="623" alt="Screenshot 2025-10-29 at 7 05 52 PM" src="https://github.com/user-attachments/assets/745d456c-ce9a-41be-b363-8ea75f52d540" />
+<img width="871" height="661" alt="Screenshot 2025-10-29 at 10 24 16 AM" src="https://github.com/user-attachments/assets/12f2d62d-3fcd-4f26-ba1e-e0c2d5d05dd0" />
