@@ -26,3 +26,8 @@ viz4
 simple_gpt_model.pt
 docs/
 viz/
+
+# Markdown files (except README.md)
+*.md
+!README.md
+compute_stats.py

@@ -6,11 +6,9 @@ Energy-Based Model for language, its based on:
 2. Stefano Ermon's CS236 Lecture 11: https://deepgenerativemodels.github.io/assets/slides/cs236_lecture11.pdf
 
 The model learns an energy function E(x, y) where low energy = good text.
-It has two modes:
-- System 1: Direct readout of energy (fast, like a regular LM)
-- System 2: Gradient descent on logits to minimize energy (slower but better)
 
-This is forced to reason vs thinking harder about the answer.
+- System 1: Regular forward pass
+- System 2: Gradient descent on logits to minimize energy
 """
 
 import torch
@@ -37,7 +35,7 @@ class EBM(nn.Module):
         # NOTE: No weight tying - energy head needs its own parameters for proper energy landscape
         self.energy_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
-        # Fixed step size for gradient descent (not learned, following EBT)
+        # https://alexiglad.github.io/blog/2025/ebt/ uses fixed step size for gradient descent as one of several stability tricks
         self.register_buffer('alpha', torch.tensor(config.alpha_value))
         
         # Initialize weights (energy head gets special initialization)
@@ -46,7 +44,6 @@ class EBM(nn.Module):
     def _init_weights(self, module):
         """Initialize weights for energy head with larger scale for meaningful gradients."""
         if isinstance(module, nn.Linear) and module == self.energy_head:
-            # Initialize with larger scale for more meaningful energy landscape
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.1)
     
     def get_hidden_states(self, idx: torch.Tensor) -> torch.Tensor:
@@ -70,8 +67,7 @@ class EBM(nn.Module):
     
     def system1_direct_energy(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        System 1: Just read out the energy directly.
-        This is what a normal language model does - one forward pass and done.
+        System 1: Regular forward pass.
         
         Returns: logits where logit = -energy (high logit = low energy = good)
         """
@@ -89,7 +85,7 @@ class EBM(nn.Module):
         """
         System 2: Gradient descent on the logits to minimize expected energy.
         
-        Implements proper EBM objective: minimize E_p[E(x,y)] where p = softmax(logits)
+        The objective is to minimize E_p[E(x,y)] where p = softmax(logits)
         and E(x,y) comes from the learned energy head (fixed during refinement).
         
         Args:
@@ -110,7 +106,6 @@ class EBM(nn.Module):
             if detach_hidden:
                 h = h.detach()
 
-            # Energy values are FIXED during refinement - this is key!
             energies = self.energy_head(h)  # (B, T, V)
 
             # Determine number of steps
@@ -120,7 +115,7 @@ class EBM(nn.Module):
                 else:
                     steps = self.config.refine_steps
 
-            # Initialize logits from System 1 (simple and stable)
+            # Initialize logits from System 1
             logits = -energies.clone()  # S1 initialization
             logits = logits.requires_grad_(True)
 
@@ -144,7 +139,7 @@ class EBM(nn.Module):
                 grad = torch.autograd.grad(
                     expected_energy,  # Minimize expected energy
                     logits,
-                    create_graph=self.training  # Keep graph for trainable thinking
+                    create_graph=self.training
                 )[0]
 
                 # Step size
@@ -416,43 +411,3 @@ class EBM(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         
         return idx
-    
-
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Create a simple config
-    config = ModelConfig(
-        vocab_size=100,
-        block_size=64,
-        n_layer=4,
-        n_head=4,
-        n_embd=128
-    )
-    
-    # Initialize model
-    model = EBM(config)
-    
-    # Test forward pass
-    batch_size, seq_len = 2, 32
-    idx = torch.randint(0, config.vocab_size, (batch_size, seq_len))
-    targets = torch.randint(0, config.vocab_size, (batch_size, seq_len))
-    
-    # Test System 1
-    logits_s1 = model.system1_direct_energy(idx)
-    print(f"System 1 logits shape: {logits_s1.shape}")
-    
-    # Test System 2
-    logits_s2 = model.system2_refine(idx, steps=3)
-    print(f"System 2 logits shape: {logits_s2.shape}")
-    
-    # Test full forward
-    loss, logits, metrics = model.forward(idx, targets=targets)
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Metrics: {metrics}")
-    
-    # Test generation
-    prompt = torch.randint(0, config.vocab_size, (1, 10))
-    generated = model.generate(prompt, max_new_tokens=20, use_thinking=True)
-    print(f"Generated shape: {generated.shape}")

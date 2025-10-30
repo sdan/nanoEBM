@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "sdan" }]
 dependencies = [
-  "torch>=2.1.0",  # user environment may already have torch; this is informative
+  "torch>=2.1.0",
   "numpy>=2.0,<3",
   "matplotlib>=3.9.0",
   "tiktoken>=0.5.0",
