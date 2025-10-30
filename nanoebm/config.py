@@ -22,6 +22,22 @@ class ModelConfig:
     langevin_noise: float = 0.005           # Small Langevin noise for exploration
     energy_convergence_threshold: float = 1e-4  # Threshold for early stopping based on energy
     warmup_steps_no_refine: int = 50        # Short warmup with S1 only
+    
+    # Contrastive divergence parameters (default: disabled)
+    use_contrastive: bool = False            # Enable contrastive divergence training
+    contrastive_type: str = "cd"             # Type: "cd", "pcd", or "fast_pcd"
+    contrastive_k: int = 1                   # Number of MCMC steps (CD-k)
+    contrastive_weight: float = 0.1          # Weight for contrastive loss
+    
+    # Langevin sampling parameters
+    langevin_step_size: float = 0.01         # Step size for Langevin dynamics
+    langevin_noise_scale: float = 0.005      # Noise scale for Langevin sampling
+    
+    # PCD-specific parameters
+    n_persistent: int = 100                  # Number of persistent particles for PCD
+    n_chains: int = 20                       # Number of parallel chains for Fast PCD
+    restart_prob: float = 0.01               # Restart probability for Fast PCD
+    buffer_init_std: float = 1.0             # Std for buffer initialization
 
 
 @chz.chz

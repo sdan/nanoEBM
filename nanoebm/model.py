@@ -281,6 +281,93 @@ class EBM(nn.Module):
         return loss, logits, metrics
     
     @torch.no_grad()
+    def compute_energy(self, idx: torch.Tensor) -> torch.Tensor:
+        """
+        Compute raw energy for contrastive training.
+        This returns the actual energy (not negative) for use in contrastive divergence.
+        
+        Args:
+            idx: Input tokens (B, T)
+            
+        Returns:
+            Energy values (B,) - one energy per sequence
+        """
+        # Get hidden states
+        h = self.get_hidden_states(idx)  # (B, T, n_embd)
+        
+        # Get energy values for all tokens
+        energies = self.energy_head(h)  # (B, T, V)
+        
+        # For contrastive training, we need the energy of the actual tokens
+        # Gather the energy of the target tokens
+        B, T = idx.shape
+        
+        # Get energy of actual tokens in the sequence
+        token_energies = energies.gather(2, idx.unsqueeze(-1)).squeeze(-1)  # (B, T)
+        
+        # Sum over sequence length to get total energy per sample
+        total_energy = token_energies.sum(dim=1)  # (B,)
+        
+        return total_energy
+    
+    def compute_energy_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Compute expected energy from logits for contrastive training.
+        
+        Args:
+            logits: Logit values (B, T, V)
+            
+        Returns:
+            Expected energy (B,) - one energy per sequence
+        """
+        # This is a simplified version for contrastive training
+        # We use negative entropy as a proxy for energy
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)  # (B, T)
+        
+        # Return negative entropy (high entropy = high energy)
+        return -entropy.sum(dim=1)  # (B,)
+    
+    def forward_with_contrastive(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        use_refine: bool = True,
+        refine_steps: int = 2,
+        contrastive_loss_fn: Optional[object] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], dict]:
+        """
+        Forward pass with optional contrastive divergence loss.
+        
+        Args:
+            idx: Input tokens (B, T)
+            targets: Target tokens for loss computation (B, T)
+            use_refine: Whether to use System 2 refinement
+            refine_steps: Number of refinement steps
+            contrastive_loss_fn: Optional contrastive loss function
+            
+        Returns: (loss, logits, metrics)
+        """
+        # Get standard forward pass results
+        nll_loss, logits, metrics = self.forward(idx, targets, use_refine, refine_steps)
+        
+        # Add contrastive loss if enabled
+        if contrastive_loss_fn is not None and targets is not None:
+            # Compute contrastive divergence loss
+            cd_loss = contrastive_loss_fn(targets)
+            
+            # Combine losses
+            total_loss = nll_loss + self.config.contrastive_weight * cd_loss
+            
+            # Update metrics
+            metrics['nll_loss'] = nll_loss.item() if nll_loss is not None else 0
+            metrics['cd_loss'] = cd_loss.item()
+            metrics['total_loss'] = total_loss.item()
+            
+            return total_loss, logits, metrics
+        
+        return nll_loss, logits, metrics
+    
     def generate(
         self,
         idx: torch.Tensor,

@@ -18,6 +18,7 @@ import torch
 from nanoebm.config import Config
 from nanoebm.model import EBM
 from nanoebm.data import get_loader
+from nanoebm.contrastive import create_contrastive_loss
 from nanoebm.utils import (
     Logger,
     save_checkpoint,
@@ -73,6 +74,11 @@ def main(cfg: Config):
     model = EBM(model_cfg).to(device)
     if cfg.train.compile:
         model = torch.compile(model)
+    
+    # Initialize contrastive loss if enabled
+    contrastive_loss_fn = create_contrastive_loss(model, model_cfg)
+    if contrastive_loss_fn is not None:
+        logger.info(f"Contrastive training enabled: type={model_cfg.contrastive_type}, k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight}")
 
     # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
@@ -138,6 +144,8 @@ def main(cfg: Config):
     print(f"Batch size:      {cfg.data.batch_size:>6d}")
     print(f"Block size:      {cfg.data.block_size:>6d}")
     print(f"Vocab size:      {vocab_size:>6d}")
+    if model_cfg.use_contrastive:
+        print(f"Contrastive:     {model_cfg.contrastive_type:>6s} (k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight:.2f})")
     print("="*60 + "\n")
 
     # Pretty, columnar console logging
@@ -148,6 +156,7 @@ def main(cfg: Config):
     # - lr/alpha: what are our step sizes?
     # - energy gap: how much does thinking help? (should be positive)
     # - E0/EK: energy before/after gradient descent
+    # - CD loss: contrastive divergence loss (if enabled)
     table_cols = [
         ("step", "step", "d", 6),
         ("loss", "loss", ".3f", 8),
@@ -157,9 +166,16 @@ def main(cfg: Config):
         ("Egap", "energy_gap", ".4f", 10),  # E0 - EK (improvement from thinking)
         ("E0", "initial_energy", ".4f", 10),  # System 1 energy
         ("EK", "final_energy", ".4f", 10),  # System 2 energy (after grad descent)
+    ]
+    
+    # Add contrastive loss column if enabled
+    if model_cfg.use_contrastive:
+        table_cols.append(("CD", "cd_loss", ".4f", 8))
+    
+    table_cols.extend([
         ("t/fwd", "time/forward", ".3f", 8),
         ("t/bwd", "time/backward", ".3f", 8),
-    ]
+    ])
 
     def _fmt_cell(val, fmt, width):
         if val is None:
@@ -217,8 +233,18 @@ def main(cfg: Config):
         with timed("forward", metrics):
             # Use System 2 only after warmup period
             use_refine = step >= cfg.model.warmup_steps_no_refine
-            # EBM model returns (loss, logits, metrics)
-            loss, logits, extras = model(x, targets=y, use_refine=use_refine, refine_steps=model_cfg.refine_steps)
+            
+            # Use contrastive loss if enabled
+            if contrastive_loss_fn is not None:
+                loss, logits, extras = model.forward_with_contrastive(
+                    x, targets=y, use_refine=use_refine, 
+                    refine_steps=model_cfg.refine_steps,
+                    contrastive_loss_fn=contrastive_loss_fn
+                )
+            else:
+                # Standard forward pass
+                loss, logits, extras = model(x, targets=y, use_refine=use_refine, refine_steps=model_cfg.refine_steps)
+            
             loss = loss / cfg.train.grad_accum_steps
 
         # Backward pass
@@ -235,7 +261,7 @@ def main(cfg: Config):
         # Logging (metrics dict persisted to JSONL/W&B)
         metrics["loss"] = loss.item() * cfg.train.grad_accum_steps
         # Optional metrics from forward extras
-        for k in ("perplexity", "energy_gap", "initial_energy", "final_energy"):
+        for k in ("perplexity", "energy_gap", "initial_energy", "final_energy", "cd_loss", "nll_loss", "total_loss"):
             if k in extras:
                 metrics[k] = extras[k]
         # Track current alpha (step size - now fixed)
