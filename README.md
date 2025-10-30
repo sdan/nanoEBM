@@ -44,6 +44,7 @@ uv run python sample.py \
 # greedy
 uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=false
 ```
+Acknowledgements to [minGPT](https://github.com/karpathy/minGPT)
 
 Some good reading:
 
