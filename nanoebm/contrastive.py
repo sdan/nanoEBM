@@ -90,27 +90,53 @@ class ContrastiveDivergenceLoss:
         """
         # Positive phase: energy of real data (tokens)
         positive_energy = self.energy_network(positive_samples)
-        
+        # Normalize by sequence length
+        T = positive_samples.shape[1]
+
+        # Helper to compute expected energy under logits given fixed token energies
+        def expected_energy_from_logits(logits: torch.Tensor, energies: torch.Tensor) -> torch.Tensor:
+            # logits, energies: (B, T, V)
+            probs = F.softmax(logits, dim=-1)
+            # sum over vocab then time -> (B,)
+            return (probs * energies).sum(dim=-1).sum(dim=-1)
+
         # Negative phase: generate samples via MCMC
-        # For token inputs, we need to work in logit space
+        # For token inputs, we need to work in logit space against fixed energies from current batch
         if positive_samples.dtype in [torch.long, torch.int32, torch.int64]:
-            # Convert tokens to logits for Langevin sampling
-            with torch.no_grad():
-                h = self.model.get_hidden_states(positive_samples)
-                logits_init = -self.model.energy_head(h)  # logits = -energy
-            
+            # Compute hidden states and energies for current batch
+            h = self.model.get_hidden_states(positive_samples)
+            energies = self.model.energy_head(h)  # (B, T, V)
+
+            # Initialize logits from system-1
+            logits_init = -energies.detach()  # detach for stable sampling
+
+            # Build a per-call sampler that uses the batch's fixed energies for gradients wrt logits
+            def energy_fn_logits(x):
+                # Use detached energies for the sampling dynamics
+                return expected_energy_from_logits(x, energies.detach())
+
+            local_sampler = LangevinSampler(
+                energy_fn=energy_fn_logits,
+                step_size=self.sampler.step_size,
+                noise_scale=self.sampler.noise_scale,
+            )
+
             # Sample in logit space
-            negative_logits = self.sampler.sample(logits_init, n_steps=self.k)
+            negative_logits = local_sampler.sample(logits_init, n_steps=self.k)
             self.last_negative_samples = negative_logits
-            
-            # Compute energy from logits
-            negative_energy = self.model.compute_energy_from_logits(negative_logits)
+
+            # Compute negative energy with gradients flowing to model params
+            negative_energy = expected_energy_from_logits(negative_logits, energies)
         else:
             # Already in continuous space
             negative_samples = self.sampler.sample(positive_samples.detach(), n_steps=self.k)
             self.last_negative_samples = negative_samples
             negative_energy = self.energy_network(negative_samples)
         
+        # Normalize by sequence length
+        positive_energy = positive_energy / T
+        negative_energy = negative_energy / T
+
         # CD loss: minimize positive energy, maximize negative energy
         loss = positive_energy.mean() - negative_energy.mean()
         
@@ -163,7 +189,13 @@ class PersistentContrastiveDivergenceLoss:
         
         # Positive phase
         positive_energy = self.energy_network(positive_samples)
-        
+        T = positive_samples.shape[1]
+
+        # Helper to compute expected energy under logits given fixed token energies
+        def expected_energy_from_logits(logits: torch.Tensor, energies: torch.Tensor) -> torch.Tensor:
+            probs = F.softmax(logits, dim=-1)
+            return (probs * energies).sum(dim=-1).sum(dim=-1)
+
         # For token inputs, work in logit space
         if positive_samples.dtype in [torch.long, torch.int32, torch.int64]:
             # Get logits for initialization if buffer is empty
@@ -173,25 +205,38 @@ class PersistentContrastiveDivergenceLoss:
                     logits_shape = (-self.model.energy_head(h)).shape  # (1, T, V)
                     buffer_shape = (self.n_persistent,) + logits_shape[1:]  # (n_persistent, T, V)
                     self.persistent_particles = torch.randn(buffer_shape, device=device) * self.buffer_init_std
-            
-            # Negative phase: sample from persistent particles
+
+            # Compute batch energies from current positives
+            h_batch = self.model.get_hidden_states(positive_samples)
+            energies_batch = self.model.energy_head(h_batch)  # (B, T, V)
+
+            # Negative phase: sample from persistent particles mapped to batch
             indices = torch.randint(0, self.n_persistent, (batch_size,))
-            selected_particles = self.persistent_particles[indices].clone()
-            
-            # Run MCMC in logit space
-            negative_logits = self.sampler.sample(selected_particles, n_steps=self.k)
+            selected_particles = self.persistent_particles[indices].clone()  # (B, T, V)
+
+            # Build per-call sampler using batch energies for gradient wrt logits
+            def energy_fn_logits(x):
+                return expected_energy_from_logits(x, energies_batch.detach())
+
+            local_sampler = LangevinSampler(
+                energy_fn=energy_fn_logits,
+                step_size=self.sampler.step_size,
+                noise_scale=self.sampler.noise_scale,
+            )
+
+            negative_logits = local_sampler.sample(selected_particles, n_steps=self.k)
             self.last_negative_samples = negative_logits
-            
+
             # Update persistent buffer
             self.persistent_particles[indices] = negative_logits.detach()
-            
-            # Energy of fantasy samples
-            negative_energy = self.model.compute_energy_from_logits(negative_logits)
+
+            # Energy of fantasy samples with gradients to model params
+            negative_energy = expected_energy_from_logits(negative_logits, energies_batch)
         else:
             # Initialize buffer if needed
             if self.persistent_particles is None:
                 self._initialize_buffer(positive_samples.shape, device)
-            
+
             # Standard PCD for continuous inputs
             indices = torch.randint(0, self.n_persistent, (batch_size,))
             selected_particles = self.persistent_particles[indices].clone()
@@ -199,6 +244,10 @@ class PersistentContrastiveDivergenceLoss:
             self.last_negative_samples = negative_samples
             self.persistent_particles[indices] = negative_samples.detach()
             negative_energy = self.energy_network(negative_samples)
+
+        # Normalize by sequence length
+        positive_energy = positive_energy / T
+        negative_energy = negative_energy / T
         
         # PCD loss
         loss = positive_energy.mean() - negative_energy.mean()
@@ -254,7 +303,13 @@ class FastPersistentContrastiveDivergenceLoss:
         
         # Positive phase
         positive_energy = self.energy_network(positive_samples)
-        
+        T = positive_samples.shape[1]
+
+        # Helper to compute expected energy under logits given fixed token energies
+        def expected_energy_from_logits(logits: torch.Tensor, energies: torch.Tensor) -> torch.Tensor:
+            probs = F.softmax(logits, dim=-1)
+            return (probs * energies).sum(dim=-1).sum(dim=-1)
+
         # For token inputs, work in logit space
         if positive_samples.dtype in [torch.long, torch.int32, torch.int64]:
             # Initialize chains if needed (in logit space)
@@ -264,39 +319,54 @@ class FastPersistentContrastiveDivergenceLoss:
                     logits_shape = (-self.model.energy_head(h)).shape  # (1, T, V)
                     chain_shape = (self.n_chains,) + logits_shape[1:]  # (n_chains, T, V)
                     self.parallel_chains = torch.randn(chain_shape, device=device) * self.buffer_init_std
-            
+
+            # Compute batch energies and expand/assign to chains for sampling dynamics
+            h_batch = self.model.get_hidden_states(positive_samples)
+            energies_batch = self.model.energy_head(h_batch)  # (B, T, V)
+            # Assign each chain a random sample's energies
+            assign = torch.randint(0, batch_size, (self.n_chains,), device=device)
+            energies_chains = energies_batch[assign]  # (n_chains, T, V)
+
             # Random restarts for some chains
             restart_mask = torch.rand(self.n_chains) < self.restart_prob
             if restart_mask.any():
                 n_restart = restart_mask.sum().item()
                 if n_restart <= batch_size:
-                    # Convert positive samples to logits for restart
                     restart_indices = torch.randperm(batch_size)[:n_restart]
                     with torch.no_grad():
                         h_restart = self.model.get_hidden_states(positive_samples[restart_indices])
                         restart_logits = -self.model.energy_head(h_restart)
                     self.parallel_chains[restart_mask] = restart_logits.detach()
                 else:
-                    # Use random noise if not enough positive samples
                     restart_samples = torch.randn_like(self.parallel_chains[restart_mask]) * self.buffer_init_std
                     self.parallel_chains[restart_mask] = restart_samples
-            
+
+            # Build per-call sampler for all chains
+            def energy_fn_logits_all(x):  # x: (n_chains, T, V)
+                return expected_energy_from_logits(x, energies_chains.detach())
+
+            local_sampler = LangevinSampler(
+                energy_fn=energy_fn_logits_all,
+                step_size=self.sampler.step_size,
+                noise_scale=self.sampler.noise_scale,
+            )
+
             # Sample from all chains in logit space
-            updated_chains = self.sampler.sample(self.parallel_chains, n_steps=self.k)
+            updated_chains = local_sampler.sample(self.parallel_chains, n_steps=self.k)
             self.parallel_chains = updated_chains.detach()
-            
+
             # Select samples for this batch
             indices = torch.randint(0, self.n_chains, (batch_size,))
             negative_logits = updated_chains[indices]
             self.last_negative_samples = negative_logits
-            
-            # Negative phase - compute energy from logits
-            negative_energy = self.model.compute_energy_from_logits(negative_logits)
+
+            # Negative phase - compute energy from logits with batch energies
+            negative_energy = expected_energy_from_logits(negative_logits, energies_batch)
         else:
             # Standard Fast PCD for continuous inputs
             if self.parallel_chains is None:
                 self._initialize_chains(positive_samples.shape, device)
-            
+
             restart_mask = torch.rand(self.n_chains) < self.restart_prob
             if restart_mask.any():
                 n_restart = restart_mask.sum().item()
@@ -306,14 +376,18 @@ class FastPersistentContrastiveDivergenceLoss:
                 else:
                     restart_samples = torch.randn_like(self.parallel_chains[restart_mask]) * self.buffer_init_std
                     self.parallel_chains[restart_mask] = restart_samples
-            
+
             updated_chains = self.sampler.sample(self.parallel_chains, n_steps=self.k)
             self.parallel_chains = updated_chains.detach()
             indices = torch.randint(0, self.n_chains, (batch_size,))
             negative_samples = updated_chains[indices]
             self.last_negative_samples = negative_samples
             negative_energy = self.energy_network(negative_samples)
-        
+
+        # Normalize by sequence length
+        positive_energy = positive_energy / T
+        negative_energy = negative_energy / T
+
         # Fast PCD loss
         loss = positive_energy.mean() - negative_energy.mean()
         
