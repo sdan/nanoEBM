@@ -46,23 +46,40 @@ class EBM(nn.Module):
         if isinstance(module, nn.Linear) and module == self.energy_head:
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.1)
     
-    def get_hidden_states(self, idx: torch.Tensor) -> torch.Tensor:
-        """Extract hidden states from transformer."""
-        device = idx.device
-        b, t = idx.size()
+    def get_hidden_states(self, idx_or_soft: torch.Tensor) -> torch.Tensor:
+        """
+        Extract hidden states from transformer.
+
+        Args:
+            idx_or_soft: Either hard tokens (B, T) or soft embeddings (B, T, n_embd)
+
+        Returns:
+            Hidden states (B, T, n_embd)
+        """
+        device = idx_or_soft.device
+
+        # Check if hard tokens or soft embeddings based on dimensionality
+        if idx_or_soft.dim() == 2:
+            # Hard tokens (B, T)
+            t = idx_or_soft.size(1)
+            tok_emb = self.transformer.transformer.wte(idx_or_soft)
+        else:
+            # Soft embeddings (B, T, n_embd)
+            t = idx_or_soft.size(1)
+            tok_emb = idx_or_soft
+
         assert t <= self.config.block_size
-        
-        # Get embeddings
+
+        # Add positional embeddings
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-        tok_emb = self.transformer.transformer.wte(idx)
         pos_emb = self.transformer.transformer.wpe(pos)
         x = self.transformer.transformer.drop(tok_emb + pos_emb)
-        
+
         # Pass through transformer blocks
         for block in self.transformer.transformer.h:
             x = block(x)
         x = self.transformer.transformer.ln_f(x)
-        
+
         return x  # (B, T, n_embd)
     
     def system1_direct_energy(self, idx: torch.Tensor) -> torch.Tensor:
@@ -76,23 +93,26 @@ class EBM(nn.Module):
         return -energy  # Flip sign: low energy should have high logit
     
     def system2_refine(
-        self, 
-        idx: torch.Tensor, 
+        self,
+        idx: torch.Tensor,
         steps: int = None,
         return_trajectory: bool = False,
-        detach_hidden: bool = False
+        detach_hidden: bool = False,
+        use_soft_tokens: bool = False
     ) -> torch.Tensor:
         """
         System 2: Gradient descent on the logits to minimize expected energy.
-        
+
         The objective is to minimize E_p[E(x,y)] where p = softmax(logits)
-        and E(x,y) comes from the learned energy head (fixed during refinement).
-        
+        and E(x,y) comes from the learned energy head.
+
         Args:
             idx: Input tokens
             steps: Number of refinement steps (None = use config/random)
             return_trajectory: Whether to return intermediate logits
             detach_hidden: Whether to detach hidden states (for stable early training)
+            use_soft_tokens: If True, recompute energies each step from soft embeddings (context shifts).
+                           If False, compute energies once from hard tokens (frozen context, default).
         """
         # Ensure gradients are enabled for refinement even if called under no_grad
         grad_ctx = torch.enable_grad() if not torch.is_grad_enabled() else nullcontext()
@@ -101,13 +121,6 @@ class EBM(nn.Module):
             V = self.config.vocab_size
             device = idx.device
 
-            # Get hidden states and energy values (fixed for this refinement)
-            h = self.get_hidden_states(idx)  # (B, T, n_embd)
-            if detach_hidden:
-                h = h.detach()
-
-            energies = self.energy_head(h)  # (B, T, V)
-
             # Determine number of steps
             if steps is None:
                 if self.training:
@@ -115,11 +128,21 @@ class EBM(nn.Module):
                 else:
                     steps = self.config.refine_steps
 
+            # Get initial hidden states and energy values
+            h = self.get_hidden_states(idx)  # (B, T, n_embd)
+            if detach_hidden:
+                h = h.detach()
+
+            energies = self.energy_head(h)  # (B, T, V)
+
             # Initialize logits from System 1
             logits = -energies.clone()  # S1 initialization
             logits = logits.requires_grad_(True)
 
             trajectory = [logits.clone()] if return_trajectory else []
+
+            # Get embedding matrix for soft tokens if needed
+            embedding_matrix = self.transformer.transformer.wte.weight if use_soft_tokens else None
 
             # Track energy for early stopping
             prev_energy = None
@@ -129,6 +152,18 @@ class EBM(nn.Module):
             for step in range(steps):
                 # Current probability distribution
                 probs = F.softmax(logits, dim=-1)  # (B, T, V)
+
+                # Recompute energies from soft embeddings if using soft tokens
+                if use_soft_tokens:
+                    # Compute soft embeddings: weighted average of token embeddings
+                    # soft_emb[b, t, :] = sum_v probs[b, t, v] * embedding_matrix[v, :]
+                    soft_embeddings = torch.einsum('btv,ve->bte', probs, embedding_matrix)  # (B, T, n_embd)
+
+                    # Recompute hidden states from soft embeddings
+                    h_soft = self.get_hidden_states(soft_embeddings)
+
+                    # Recompute energies (energy landscape shifts with changing context)
+                    energies = self.energy_head(h_soft)  # (B, T, V)
 
                 # Expected energy under current distribution: E_p[E(x,y)]
                 # This is what we minimize in EBM
@@ -221,7 +256,7 @@ class EBM(nn.Module):
         
         if use_refine:
             # System 2: Refined prediction
-            logits_s2 = self.system2_refine(idx, steps=refine_steps)
+            logits_s2 = self.system2_refine(idx, steps=refine_steps, use_soft_tokens=self.config.use_soft_tokens)
             probs_s2 = F.softmax(logits_s2, dim=-1)
             EE_s2 = (probs_s2 * energies).sum(dim=-1).mean()  # Expected energy S2
             logits = logits_s2
@@ -272,7 +307,36 @@ class EBM(nn.Module):
                     'ppl_s1': torch.exp(nll_s1).item(),
                     'perplexity': torch.exp(nll_s1).item(),
                 })
-        
+
+            # Optional: in-batch InfoNCE over sequence energies (conditional EBM contrast)
+            if getattr(self.config, 'info_nce_weight', 0.0) > 0.0:
+                # energies: (B, T, V) from current batch contexts (idx)
+                # Build pairwise energy matrix E_ij = sum_t E(x_i, y_j[t]) using gather without extra forwards
+                B, T = idx.shape
+                device = idx.device
+                # Prepare for broadcasting: (B, 1, T, V) and (1, B, T, 1)
+                energies_b = energies.unsqueeze(1).expand(B, B, T, energies.size(-1))
+                targets_b = targets.unsqueeze(0).expand(B, B, T)
+                # Gather energies for each pair (i,j) across vocab axis
+                pairwise_token_E = torch.gather(energies_b, dim=-1, index=targets_b.unsqueeze(-1)).squeeze(-1)  # (B,B,T)
+                # Sum over time to get sequence energy; normalize by T for scale stability
+                E_mat = pairwise_token_E.sum(dim=-1) / float(T)  # (B,B)
+                # Convert to scores (higher is better) and apply temperature
+                tau = max(1e-6, float(getattr(self.config, 'info_nce_temperature', 1.0)))
+                S = (-E_mat) / tau  # (B,B)
+                targets_inbatch = torch.arange(B, device=device)
+                info_nce_loss = F.cross_entropy(S, targets_inbatch)
+                # Combine
+                weight = float(self.config.info_nce_weight)
+                loss = loss + weight * info_nce_loss if loss is not None else weight * info_nce_loss
+                # Metrics
+                with torch.no_grad():
+                    acc = (S.argmax(dim=1) == targets_inbatch).float().mean().item()
+                metrics.update({
+                    'info_nce_loss': info_nce_loss.item(),
+                    'info_nce_acc': acc,
+                })
+
         return loss, logits, metrics
     
     @torch.no_grad()
@@ -391,7 +455,7 @@ class EBM(nn.Module):
             
             # Get logits for next token
             if use_thinking:
-                logits = self.system2_refine(idx_cond, steps=think_steps)
+                logits = self.system2_refine(idx_cond, steps=think_steps, use_soft_tokens=self.config.use_soft_tokens)
             else:
                 logits = self.system1_direct_energy(idx_cond)
             

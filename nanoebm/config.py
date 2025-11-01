@@ -22,7 +22,8 @@ class ModelConfig:
     langevin_noise: float = 0.005           # Small Langevin noise for exploration
     energy_convergence_threshold: float = 1e-4  # Threshold for early stopping based on energy
     warmup_steps_no_refine: int = 50        # Short warmup with S1 only
-    
+    use_soft_tokens: bool = False           # Recompute energies from soft embeddings each refinement step
+
     # Contrastive divergence parameters (default: disabled)
     use_contrastive: bool = False            # Enable contrastive divergence training
     contrastive_type: str = "cd"             # Type: "cd", "pcd", or "fast_pcd"
