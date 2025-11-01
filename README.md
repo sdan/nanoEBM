@@ -44,6 +44,36 @@ uv run python sample.py \
 # greedy
 uv run python sample.py checkpoint=out_ebt/final.pt use_thinking=false
 ```
+
+## Soft Tokens (Shifting Context Refinement)
+
+By default, refinement uses **hard tokens** (frozen context). You can enable **soft tokens** to allow the context to shift during refinement:
+
+```bash
+# Train with soft tokens - context becomes a distribution and shifts during refinement
+uv run python train.py model.use_soft_tokens=true
+
+# Sample with soft tokens
+uv run python sample.py checkpoint=out_ebt/final.pt model.use_soft_tokens=true
+
+# Compare hard vs soft tokens
+# First train both:
+uv run python train.py out_dir=out_hard model.use_soft_tokens=false train.max_steps=5000
+uv run python train.py out_dir=out_soft model.use_soft_tokens=true train.max_steps=5000
+
+# Then compare:
+uv run python compare_soft_vs_hard.py \
+  --hard_ckpt out_hard/run_*/final.pt \
+  --soft_ckpt out_soft/run_*/final.pt \
+  --eval_batches 100
+```
+
+**Key difference:**
+- **Hard tokens (default)**: Energy landscape computed once from discrete tokens, stays frozen during refinement
+- **Soft tokens**: Energy landscape recomputed each step from soft embeddings (weighted average), allows context to shift
+
+Trade-off: Soft tokens are ~2-3x slower but may improve perplexity by allowing joint optimization of context and predictions.
+
 Acknowledgements to [minGPT](https://github.com/karpathy/minGPT)
 
 Some good reading:
