@@ -98,7 +98,8 @@ class EBM(nn.Module):
         steps: int = None,
         return_trajectory: bool = False,
         detach_hidden: bool = False,
-        use_soft_tokens: bool = False
+        use_soft_tokens: bool = False,
+        refine_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         System 2: Gradient descent on the logits to minimize expected energy.
@@ -107,12 +108,14 @@ class EBM(nn.Module):
         and E(x,y) comes from the learned energy head.
 
         Args:
-            idx: Input tokens
+            idx: Input tokens (B, T)
             steps: Number of refinement steps (None = use config/random)
             return_trajectory: Whether to return intermediate logits
             detach_hidden: Whether to detach hidden states (for stable early training)
             use_soft_tokens: If True, recompute energies each step from soft embeddings (context shifts).
-                           If False, compute energies once from hard tokens (frozen context, default).
+                             If False, compute energies once from hard tokens (frozen context, default).
+            refine_mask: Optional mask (B, T) where 1 = positions whose energies
+                         contribute to the refinement objective (e.g., answer tokens).
         """
         # Ensure gradients are enabled for refinement even if called under no_grad
         grad_ctx = torch.enable_grad() if not torch.is_grad_enabled() else nullcontext()
@@ -148,6 +151,16 @@ class EBM(nn.Module):
             prev_energy = None
             early_stop_patience = 0
 
+            # Optional refinement mask over sequence positions
+            if refine_mask is not None:
+                # Ensure shape and dtype are compatible
+                if refine_mask.dim() == 2:
+                    mask = refine_mask.to(device=idx.device, dtype=energies.dtype).unsqueeze(-1)  # (B, T, 1)
+                else:
+                    raise ValueError("refine_mask must have shape (B, T)")
+            else:
+                mask = None
+
             # Gradient descent loop
             for step in range(steps):
                 # Current probability distribution
@@ -166,8 +179,19 @@ class EBM(nn.Module):
                     energies = self.energy_head(h_soft)  # (B, T, V)
 
                 # Expected energy under current distribution: E_p[E(x,y)]
-                # This is what we minimize in EBM
-                expected_energy = (probs * energies).sum(dim=-1).mean()
+                # This is what we minimize in EBM. If a mask is provided,
+                # restrict the objective to those positions (e.g., answer tokens).
+                per_pos_E = (probs * energies).sum(dim=-1)  # (B, T)
+                if mask is not None:
+                    masked_E = per_pos_E * mask.squeeze(-1)  # (B, T)
+                    denom = mask.sum()  # total number of contributing positions
+                    if denom.item() == 0:
+                        # If mask is all-zero, fall back to full sequence objective
+                        expected_energy = per_pos_E.mean()
+                    else:
+                        expected_energy = masked_E.sum() / denom
+                else:
+                    expected_energy = per_pos_E.mean()
 
                 # Compute gradient of expected energy w.r.t. logits
                 # Using autograd for second-order gradients during training
@@ -434,7 +458,10 @@ class EBM(nn.Module):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         use_thinking: bool = True,
-        think_steps: int = 4
+        think_steps: int = 4,
+        sample: bool = True,
+        answer_start: Optional[int] = None,
+        refine_scope: str = "all",
     ) -> torch.Tensor:
         """
         Generate tokens with optional System 2 thinking.
@@ -446,6 +473,11 @@ class EBM(nn.Module):
             top_k: Optional top-k filtering
             use_thinking: Whether to use System 2 refinement
             think_steps: Number of refinement steps when thinking
+            sample: If True, sample from distribution; else greedy.
+            answer_start: Optional global index where answer tokens begin
+                          in the original sequence (used for answer-only refinement).
+            refine_scope: 'all' (default, refine all positions) or
+                          'answer' (refine only answer tokens).
         
         Returns: Generated token sequence
         """
@@ -455,21 +487,40 @@ class EBM(nn.Module):
             
             # Get logits for next token
             if use_thinking:
-                logits = self.system2_refine(idx_cond, steps=think_steps, use_soft_tokens=self.config.use_soft_tokens)
+                refine_mask = None
+                if answer_start is not None and refine_scope == "answer":
+                    # Compute where the answer segment starts within the cropped context.
+                    total_len = idx.size(1)
+                    T = idx_cond.size(1)
+                    offset = total_len - T  # number of tokens dropped from the left
+                    local_start = max(0, answer_start - offset)
+                    refine_mask = torch.zeros(idx_cond.size(0), T, device=idx.device)
+                    if local_start < T:
+                        refine_mask[:, local_start:] = 1.0
+
+                logits = self.system2_refine(
+                    idx_cond,
+                    steps=think_steps,
+                    use_soft_tokens=self.config.use_soft_tokens,
+                    refine_mask=refine_mask,
+                )
             else:
                 logits = self.system1_direct_energy(idx_cond)
             
-            # Focus on last position
-            logits = logits[:, -1, :] / temperature
+            # Focus on last position and scale
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
             
             # Optional top-k filtering
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             
-            # Sample from distribution
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            # Convert to next token (greedy or sampling)
+            if sample:
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             
             # Append to sequence
             idx = torch.cat((idx, idx_next), dim=1)

@@ -44,11 +44,14 @@ class ModelConfig:
 @chz.chz
 class DataConfig:
     """Dataset configuration"""
-    dataset: str = "shakespeare"  # shakespeare, wikitext
+    dataset: str = "shakespeare"  # "shakespeare" (char-level) or "gsm8k" (BPE math)
     data_path: str = "shakespeare.txt"
     block_size: int = 256
     batch_size: int = 64
     num_workers: int = 0
+    # BPE / HF dataset options (used for GSM8K experiments)
+    bpe_encoding: str = "gpt2"
+    hf_cache_dir: str | None = None
 
 
 @chz.chz

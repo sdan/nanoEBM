@@ -114,7 +114,8 @@ def main(cfg: SampleConfig):
             max_new_tokens=cfg.max_new_tokens,
             temperature=cfg.sample_temp if cfg.sample else 1.0,
             top_k=cfg.topk,
-            use_thinking=False
+            use_thinking=False,
+            sample=cfg.sample,
         )
     elif cfg.mode == "think":
         print(f"Generating with System 2 (thinking mode, steps={cfg.think_steps})...")
@@ -124,7 +125,8 @@ def main(cfg: SampleConfig):
             temperature=cfg.sample_temp if cfg.sample else 1.0,
             top_k=cfg.topk,
             use_thinking=True,
-            think_steps=cfg.think_steps
+            think_steps=cfg.think_steps,
+            sample=cfg.sample,
         )
     else:
         raise ValueError(f"Unknown mode: {cfg.mode}. Use 'fast', 'think'")
